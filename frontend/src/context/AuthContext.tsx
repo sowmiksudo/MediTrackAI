@@ -22,6 +22,7 @@ export interface AuthUser {
   full_name: string;
   email?: string | null;
   phone_e164?: string | null;
+  role?: string;
 }
 
 interface AuthContextValue {

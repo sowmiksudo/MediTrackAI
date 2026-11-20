@@ -25,7 +25,7 @@ from auth.security import decode_access_token, verify_upload_signature
 from clinical.red_flag_gate import evaluate_text_red_flags
 from db.database import SessionLocal, engine, get_db
 from db.models import BackgroundJob, CheckIn, PatientProfile, Prescription, Report, User
-from routers import auth, briefs, checkins, drugs, jobs, live_ws, prescriptions, profiles, rag, reports, telemetry
+from routers import auth, briefs, checkins, drugs, jobs, live_docs, live_ws, prescriptions, profiles, rag, reports, telemetry
 
 settings = get_settings()
 
@@ -151,6 +151,7 @@ app.include_router(jobs.router)
 app.include_router(rag.router)
 app.include_router(drugs.router)
 app.include_router(telemetry.router)
+app.include_router(live_docs.router)
 app.include_router(live_ws.router)
 
 

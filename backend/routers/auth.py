@@ -68,6 +68,7 @@ def _build_auth_response(user: User, db: Session) -> AuthResponse:
             "full_name": user.full_name,
             "email": user.email,
             "phone_e164": user.phone_e164,
+            "role": getattr(user, "role", "user") or "user",
         },
         profiles=[_serialize_profile(p) for p in profiles],
     )
@@ -153,6 +154,7 @@ def me(current_user: User = Depends(get_current_user), db: Session = Depends(get
             "full_name": current_user.full_name,
             "email": current_user.email,
             "phone_e164": current_user.phone_e164,
+            "role": getattr(current_user, "role", "user") or "user",
         },
         "profiles": [_serialize_profile(p).model_dump() for p in profiles],
     }

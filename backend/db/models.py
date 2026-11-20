@@ -29,6 +29,7 @@ class User(Base):
     phone_e164 = Column(String(32), unique=True, nullable=True, index=True)
     password_hash = Column(String(255), nullable=False)
     full_name = Column(String(255), nullable=False)
+    role = Column(String(32), nullable=False, default="user")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     profiles = relationship("PatientProfile", back_populates="owner", cascade="all, delete-orphan")
@@ -285,4 +286,61 @@ class KnowledgeChunk(Base):
     embedding_bge_m3 = Column(HALFVEC(1024), nullable=True)
     embedding_gemini_mm = Column(HALFVEC(1536), nullable=True)
     bge_sparse_weights = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class LiveDocsSettings(Base):
+    __tablename__ = "live_docs_settings"
+
+    id = Column(Integer, primary_key=True, default=1)
+    visibility_mode = Column(String(24), nullable=False, default="force_on")  # force_on | force_off | schedule
+    publish_start_at = Column(DateTime(timezone=True), nullable=True)
+    publish_end_at = Column(DateTime(timezone=True), nullable=True)
+    duration_hours = Column(Integer, nullable=True)
+    team_name = Column(String(160), nullable=False, default="Team MediTrackAI")
+    active_version_tag = Column(String(48), nullable=False, default="v1.0.0")
+    updated_by = Column(String(255), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class LiveDocsSection(Base):
+    __tablename__ = "live_docs_sections"
+
+    id = Column(Integer, primary_key=True, index=True)
+    slug = Column(String(80), unique=True, nullable=False, index=True)
+    category = Column(String(24), nullable=False, default="technical")  # pitch | technical
+    section_code = Column(String(16), nullable=True)  # e.g., YC-01, A..O
+    title = Column(String(200), nullable=False)
+    subtitle = Column(String(300), nullable=True)
+    sort_order = Column(Integer, nullable=False, default=0, index=True)
+    is_visible = Column(Boolean, nullable=False, default=True)
+    content_markdown = Column(Text, nullable=False, default="")
+    draft_markdown = Column(Text, nullable=False, default="")
+    mermaid_diagram = Column(Text, nullable=True)
+    draft_mermaid = Column(Text, nullable=True)
+    has_unpublished_changes = Column(Boolean, nullable=False, default=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class LiveDocsTeamMember(Base):
+    __tablename__ = "live_docs_team_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    full_name = Column(String(160), nullable=False)
+    role_title = Column(String(160), nullable=False)
+    email = Column(String(255), nullable=False)
+    avatar_url = Column(Text, nullable=True)
+    sort_order = Column(Integer, nullable=False, default=0)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class LiveDocsVersion(Base):
+    __tablename__ = "live_docs_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    version_tag = Column(String(48), nullable=False)
+    summary = Column(String(300), nullable=False)
+    snapshot_json = Column(JSONB, nullable=False, default=dict)
+    published_by = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

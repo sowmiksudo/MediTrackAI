@@ -39,6 +39,29 @@ def get_current_user(
     return user
 
 
+def get_optional_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> Optional[User]:
+    if not credentials or not credentials.credentials:
+        return None
+    try:
+        payload = decode_access_token(credentials.credentials)
+        user_id = uuid.UUID(str(payload.get("sub")))
+        return db.query(User).filter(User.id == user_id).first()
+    except Exception:
+        return None
+
+
+def require_admin_user(current_user: User = Depends(get_current_user)) -> User:
+    if (getattr(current_user, "role", "user") or "user") not in ("admin", "super_admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or Super Admin privileges required",
+        )
+    return current_user
+
+
 def get_active_profile(
     x_profile_id: Optional[str] = Header(default=None, alias="X-Profile-Id"),
     current_user: User = Depends(get_current_user),

@@ -29,6 +29,9 @@ async def seed_demo_async(db: Session) -> dict:
     email = "demo@meditrack.bd"
     existing_user = db.query(User).filter(User.email == email).first()
     if existing_user:
+        if getattr(existing_user, "role", "user") != "super_admin":
+            existing_user.role = "super_admin"
+            db.commit()
         profiles = db.query(PatientProfile).filter(PatientProfile.owner_user_id == existing_user.id).all()
         return {
             "status": "already_exists",
@@ -41,6 +44,7 @@ async def seed_demo_async(db: Session) -> dict:
         phone_e164="+8801711000111",
         password_hash=hash_password("MediTrack2026!"),
         full_name="Sadia Rahman",
+        role="super_admin",
     )
     db.add(user)
     db.flush()

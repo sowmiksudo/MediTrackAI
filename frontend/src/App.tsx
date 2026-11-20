@@ -1,3 +1,4 @@
+import { Suspense, lazy } from "react";
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -12,6 +13,8 @@ import PublicBrief from "./pages/PublicBrief";
 import Summaries from "./pages/Summaries";
 import Upload from "./pages/Upload";
 import VisitPrep from "./pages/VisitPrep";
+
+const Docs = lazy(() => import("./pages/Docs"));
 
 const queryClient = new QueryClient();
 
@@ -36,6 +39,14 @@ const App = () => (
           <Routes>
             <Route path="/login" element={<Login />} />
             <Route path="/brief/:token" element={<PublicBrief />} />
+            <Route
+              path="/docs"
+              element={
+                <Suspense fallback={<div className="flex h-screen items-center justify-center text-sm text-muted-foreground">Loading Live Docs...</div>}>
+                  <Docs />
+                </Suspense>
+              }
+            />
             <Route
               path="/"
               element={

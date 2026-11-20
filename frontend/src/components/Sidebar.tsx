@@ -45,7 +45,14 @@ export const Sidebar = () => {
           ))}
         </nav>
 
-        <div className="border-t border-border p-4">
+        <div className="border-t border-border p-4 space-y-2.5">
+          <NavLink
+            to="/docs"
+            className="flex items-center justify-between rounded-lg border border-border bg-background px-3 py-2 text-xs font-semibold text-foreground hover:border-primary/40 hover:bg-primary/5 transition-colors"
+          >
+            <span>Live Pitch & Docs</span>
+            <span className="rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] text-primary">/docs</span>
+          </NavLink>
           <div className="rounded-lg bg-primary/5 border border-primary/15 p-3">
             <p className="text-xs font-semibold text-primary">BD Clinical Companion</p>
             <p className="mt-1 text-[11px] text-muted-foreground">
