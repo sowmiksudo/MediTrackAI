@@ -1,164 +1,288 @@
-from sqlalchemy import Column, Integer, String, Text, Float, DateTime, JSON
+import uuid
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Computed,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR, UUID
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from pgvector.sqlalchemy import HALFVEC
+
 from db.database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String(255), unique=True, nullable=True, index=True)
+    phone_e164 = Column(String(32), unique=True, nullable=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    full_name = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    profiles = relationship("PatientProfile", back_populates="owner", cascade="all, delete-orphan")
+
+
+class PatientProfile(Base):
+    __tablename__ = "patient_profiles"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    display_name = Column(String(120), nullable=False)
+    relationship_type = Column("relationship", String(40), nullable=False, default="self")
+    date_of_birth = Column(Date, nullable=True)
+    sex = Column(String(16), nullable=True)  # M | F | Other
+    chronic_conditions = Column(JSONB, nullable=False, default=list)
+    allergies = Column(JSONB, nullable=False, default=list)
+    emergency_contact_phone = Column(String(32), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    owner = relationship("User", back_populates="profiles")
+
+
+class PdpaConsent(Base):
+    __tablename__ = "pdpa_consents"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    patient_profile_id = Column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    consent_version = Column(String(32), nullable=False, default="bd-pdpa-2026-v1")
+    accepted_local_storage = Column(Boolean, nullable=False, default=True)
+    accepted_cloud_ai_processing = Column(Boolean, nullable=False, default=True)
+    accepted_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class CheckIn(Base):
     __tablename__ = "checkins"
 
     id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    audio_path = Column(String)
-    transcript = Column(JSON) 
-    summary = Column(JSON)     
-    mood = Column(String)
-    symptoms = Column(JSON)    
-    medications_taken = Column(JSON)
-    sleep_quality = Column(String)
-    energy_level = Column(String)
-    concerns = Column(JSON)
-    ai_insights = Column(JSON)
-    overall_score = Column(String)
+    patient_profile_id = Column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    audio_path = Column(String(512), nullable=True)
+    transcript = Column(JSONB, nullable=True)
+    pii_redacted_transcript = Column(JSONB, nullable=True)
+    summary = Column(Text, nullable=True)
+    mood = Column(String(64), nullable=True)
+    symptoms = Column(JSONB, nullable=False, default=list)
+    medications_mentioned = Column(JSONB, nullable=False, default=list)
+    sleep_quality = Column(String(64), nullable=True)
+    energy_level = Column(String(64), nullable=True)
+    concerns = Column(JSONB, nullable=False, default=list)
+    ai_insights = Column(JSONB, nullable=False, default=list)
+    red_flags_detected = Column(JSONB, nullable=False, default=list)
+    overall_score = Column(String(16), nullable=False, default="neutral")  # positive | neutral | negative
+    language_detected = Column(String(32), nullable=True, default="bn-en")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
 class Prescription(Base):
     __tablename__ = "prescriptions"
-    
+
     id = Column(Integer, primary_key=True, index=True)
-    file_path = Column(String, nullable=False)
-    ocr_text = Column(Text, nullable=True)
-    
-    # Doctor information
-    doctor_name = Column(String, nullable=True)
-    doctor_qualification = Column(String, nullable=True)
-    doctor_registration_number = Column(String, nullable=True)
-    hospital = Column(String, nullable=True)
-    doctor_contact_info = Column(String, nullable=True)
-    prescription_date = Column(String, nullable=True)
-    
-    # Patient information
-    patient_name = Column(String, nullable=True)
-    patient_age = Column(String, nullable=True)
-    patient_gender = Column(String, nullable=True)
-    
-    # Medicines (stored as JSON array)
-    # Each medicine: {name, dosage, frequency, duration, special_instructions}
-    medicines = Column(JSON, nullable=True)
-    
-    # Summary information
+    patient_profile_id = Column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    file_path = Column(String(512), nullable=False)
+    doc_date = Column(String(32), nullable=True)
+    doctor_name = Column(String(255), nullable=True)
+    doctor_qualification = Column(String(255), nullable=True)
+    doctor_bmdc_reg = Column(String(64), nullable=True)
+    hospital = Column(String(255), nullable=True)
     diagnosis = Column(Text, nullable=True)
-    symptoms = Column(Text, nullable=True)
-    advice = Column(Text, nullable=True)
-    follow_up = Column(String, nullable=True)
+    raw_ocr_text = Column(Text, nullable=True)
+    extracted_json = Column(JSONB, nullable=True)
+    verification_status = Column(String(32), nullable=False, default="pending_review")  # pending_review | confirmed
+    overall_confidence = Column(Float, nullable=True)
+    ddi_alerts = Column(JSONB, nullable=False, default=list)
     prescription_summary = Column(Text, nullable=True)
-    
-    # Full structured data as JSON backup
-    structured_data = Column(JSON, nullable=True)
-    
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
 class Report(Base):
     __tablename__ = "reports"
-    
+
     id = Column(Integer, primary_key=True, index=True)
-    file_path = Column(String, nullable=False)
-    ocr_text = Column(Text, nullable=True)
-    
-    # Report metadata
-    report_date = Column(String, nullable=True)
-    report_time = Column(String, nullable=True)
-    
-    # Raw lab data (stored as JSON)
-    # Structure: {report_date, report_time, metrics: [{test_name, category, value, unit, reference_range, interpretation}]}
-    raw_lab_data = Column(JSON, nullable=True)
-    
-    # Lab analysis (analyzed metrics with interpretations)
-    # Structure: {analyzed_metrics: [{test_name, status, value, unit, reference_range, interpretation}], pattern_insights: [], summary}
-    lab_analysis = Column(JSON, nullable=True)
-    
-    # Risk scores
-    # Structure: {category_scores: [{category, score}], overall_health_risk_index, severity, critical_flags, summary}
-    lab_risk_scores = Column(JSON, nullable=True)
-    
-    # Overall health risk index
-    overall_health_risk_index = Column(Float, nullable=True)
-    severity = Column(String, nullable=True)
-    critical_flags = Column(JSON, nullable=True)
-    
-    # Lab summary
-    # Structure: {overview, key_findings: [{metric, value, interpretation}], overall_risk, tone, recommendations: [], critical_alerts: []}
+    patient_profile_id = Column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    file_path = Column(String(512), nullable=False)
+    lab_name = Column(String(255), nullable=True)
+    report_date = Column(String(32), nullable=True)
+    raw_ocr_text = Column(Text, nullable=True)
+    extracted_json = Column(JSONB, nullable=True)
+    verification_status = Column(String(32), nullable=False, default="confirmed")
+    critical_alerts = Column(JSONB, nullable=False, default=list)
     lab_summary_overview = Column(Text, nullable=True)
-    key_findings = Column(JSON, nullable=True)
-    overall_risk = Column(String, nullable=True)
-    tone = Column(String, nullable=True)
-    recommendations = Column(JSON, nullable=True)
-    critical_alerts = Column(JSON, nullable=True)
-    
-    # Full structured data as JSON backup
-    structured_data = Column(JSON, nullable=True)
-    
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    deterministic_scores = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
-class OverallReport(Base):
-    __tablename__ = "overall_reports"
-    
+
+class DoctorBrief(Base):
+    __tablename__ = "doctor_briefs"
+
     id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    pdf_file_path = Column(String, nullable=True)
-    
-    # Timeline section
-    # Structure: {events: [{date, event_type, description, source}]}
-    timeline = Column(JSON, nullable=True)
-    
-    # Clinical trends section
-    # Structure: {trends: [{metric, previous_value, current_value, trend, status, clinical_comment}], overall_summary}
-    clinical_trends = Column(JSON, nullable=True)
-    
-    # Risk and severity section
-    # Structure: {disease_risks: [{disease, risk_score, severity_level}], overall_health_index, overall_severity, clinical_comment}
-    risk_and_severity = Column(JSON, nullable=True)
-    overall_health_index = Column(Float, nullable=True)
-    overall_severity = Column(String, nullable=True)
-    
-    # Possible conditions section
-    # Structure: {conditions: [{condition, confidence, recommended_action}], summary_comment}
-    possible_conditions = Column(JSON, nullable=True)
-    
-    # Medication overview section
-    # Structure: {current_medications: [], past_medications: [{name, dosage, frequency, duration, start_date, end_date, special_instructions, source}], medication_timeline: [], medication_summary}
-    medication_overview = Column(JSON, nullable=True)
-    
-    # Final report section
-    # Structure: {patient_overview, risk_level, next_steps: [], summary_comment}
-    final_report = Column(JSON, nullable=True)
-    patient_overview = Column(Text, nullable=True)
-    risk_level = Column(String, nullable=True)
-    next_steps = Column(JSON, nullable=True)
-    summary_comment = Column(Text, nullable=True)
-    
-    # Full structured data as JSON backup (entire report)
-    structured_data = Column(JSON, nullable=True)
+    patient_profile_id = Column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    pdf_file_path = Column(String(512), nullable=True)
+    share_token_hash = Column(String(128), unique=True, nullable=True, index=True)
+    share_expires_at = Column(DateTime(timezone=True), nullable=True)
+    brief_payload = Column(JSONB, nullable=False, default=dict)
+    deterministic_scores = Column(JSONB, nullable=False, default=dict)
+    citations = Column(JSONB, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
-class Hospital(Base):
-    __tablename__ = "hospitals"
-    
+class BackgroundJob(Base):
+    __tablename__ = "background_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    patient_profile_id = Column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    job_type = Column(String(32), nullable=False)  # rx_parse | lab_parse | brief_gen | reindex
+    status = Column(String(32), nullable=False, default="queued")  # queued | running | completed | failed
+    progress_pct = Column(Integer, nullable=False, default=0)
+    current_step = Column(String(128), nullable=False, default="Queued")
+    result_id = Column(String(64), nullable=True)
+    result_payload = Column(JSONB, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class BdDrugCatalog(Base):
+    __tablename__ = "bd_drug_catalog"
+    __table_args__ = (
+        UniqueConstraint("brand_name", "strength", "dosage_form", name="uq_bd_drug_brand_strength_form"),
+        Index("ix_bd_drug_brand_trgm", "brand_name", postgresql_using="gin", postgresql_ops={"brand_name": "gin_trgm_ops"}),
+        Index("ix_bd_drug_generic_trgm", "generic_name", postgresql_using="gin", postgresql_ops={"generic_name": "gin_trgm_ops"}),
+    )
+
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, nullable=False)
-    speciality = Column(String, nullable=False)
-    location = Column(String, nullable=False)
-    reviews = Column(Float, nullable=True)
-    contact_info = Column(String, nullable=True)
-    description = Column(Text, nullable=True)
+    brand_name = Column(String(160), nullable=False)
+    generic_name = Column(String(200), nullable=False)
+    strength = Column(String(80), nullable=False, default="")
+    dosage_form = Column(String(80), nullable=False, default="Tablet")
+    manufacturer = Column(String(160), nullable=True)
+    indicative_price_bdt = Column(Float, nullable=True)
+    atc_code = Column(String(32), nullable=True)
+    drug_class = Column(String(120), nullable=True)
 
 
-class Insurance(Base):
-    __tablename__ = "insurances"
-    
+class BdDdiRule(Base):
+    __tablename__ = "bd_ddi_rules"
+    __table_args__ = (
+        UniqueConstraint("drug_a_generic", "drug_b_generic", "rule_type", name="uq_bd_ddi_pair"),
+    )
+
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, nullable=False)
-    coverage = Column(String, nullable=False)
-    premium = Column(Float, nullable=False)
-    key_features = Column(JSON, nullable=True)
-    provider = Column(String, nullable=False)
+    drug_a_generic = Column(String(160), nullable=False, index=True)
+    drug_b_generic = Column(String(160), nullable=False, index=True)
+    rule_type = Column(String(32), nullable=False)  # duplicate_class | major_ddi | moderate_ddi
+    severity = Column(String(16), nullable=False)  # critical | warning | info
+    clinical_note = Column(Text, nullable=False)
+
+
+class LoincLabReference(Base):
+    __tablename__ = "loinc_lab_reference"
+
+    loinc_code = Column(String(32), primary_key=True)
+    canonical_name = Column(String(160), nullable=False, index=True)
+    aliases = Column(ARRAY(String), nullable=False, default=list)
+    standard_unit = Column(String(32), nullable=False)
+    alt_units = Column(JSONB, nullable=False, default=dict)  # e.g. {"mg/dL": {"op": "div", "factor": 18.0182}}
+    ref_low_male = Column(Float, nullable=True)
+    ref_high_male = Column(Float, nullable=True)
+    ref_low_female = Column(Float, nullable=True)
+    ref_high_female = Column(Float, nullable=True)
+    critical_low = Column(Float, nullable=True)
+    critical_high = Column(Float, nullable=True)
+
+
+class ClinicalObservation(Base):
+    __tablename__ = "clinical_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    patient_profile_id = Column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_type = Column(String(32), nullable=False)  # lab | checkin
+    source_id = Column(Integer, nullable=False)
+    loinc_code = Column(String(32), ForeignKey("loinc_lab_reference.loinc_code", ondelete="SET NULL"), nullable=True, index=True)
+    raw_name = Column(String(160), nullable=False)
+    raw_value = Column(String(64), nullable=False)
+    raw_unit = Column(String(32), nullable=True)
+    canonical_value = Column(Float, nullable=True)
+    canonical_unit = Column(String(32), nullable=True)
+    reference_range = Column(String(80), nullable=True)
+    flag = Column(String(16), nullable=False, default="normal")  # low | normal | high | critical
+    observed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
+class MedicationEpisode(Base):
+    __tablename__ = "medication_episodes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    patient_profile_id = Column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    prescription_id = Column(Integer, ForeignKey("prescriptions.id", ondelete="CASCADE"), nullable=True, index=True)
+    raw_brand_name = Column(String(160), nullable=False)
+    matched_drug_id = Column(Integer, ForeignKey("bd_drug_catalog.id", ondelete="SET NULL"), nullable=True)
+    generic_name = Column(String(200), nullable=True)
+    drug_class = Column(String(120), nullable=True)
+    dosage = Column(String(80), nullable=True)
+    frequency_bd = Column(String(80), nullable=True)  # e.g. "1+0+1"
+    duration_days = Column(Integer, nullable=True)
+    special_instructions = Column(String(255), nullable=True)
+    match_confidence = Column(Float, nullable=False, default=0.0)
+    needs_user_confirm = Column(Boolean, nullable=False, default=True)
+    status = Column(String(24), nullable=False, default="active")  # active | completed | stopped
+    started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ClinicalEdge(Base):
+    __tablename__ = "clinical_edges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    patient_profile_id = Column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    src_type = Column(String(32), nullable=False)
+    src_id = Column(String(64), nullable=False)
+    edge_type = Column(String(48), nullable=False)  # PRESCRIBED_FOR | TRIGGERED_ALERT | FOLLOW_UP_OF | DUPLICATE_OF
+    dst_type = Column(String(32), nullable=False)
+    dst_id = Column(String(64), nullable=False)
+    edge_metadata = Column("metadata", JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class KnowledgeChunk(Base):
+    __tablename__ = "knowledge_chunks"
+    __table_args__ = (
+        Index("ix_kc_tsv_gin", "tsv", postgresql_using="gin"),
+        Index(
+            "ix_kc_bge_m3_hnsw",
+            "embedding_bge_m3",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding_bge_m3": "halfvec_cosine_ops"},
+        ),
+        Index(
+            "ix_kc_gemini_mm_hnsw",
+            "embedding_gemini_mm",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding_gemini_mm": "halfvec_cosine_ops"},
+        ),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    patient_profile_id = Column(UUID(as_uuid=True), ForeignKey("patient_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_type = Column(String(32), nullable=False)  # checkin | prescription | lab_report | medication | observation
+    source_id = Column(String(64), nullable=False)
+    chunk_text = Column(Text, nullable=False)
+    language = Column(String(24), nullable=False, default="en")
+    event_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    chunk_metadata = Column(JSONB, nullable=False, default=dict)
+    tsv = Column(TSVECTOR, Computed("to_tsvector('english', chunk_text)", persisted=True), nullable=False)
+    embedding_bge_m3 = Column(HALFVEC(1024), nullable=True)
+    embedding_gemini_mm = Column(HALFVEC(1536), nullable=True)
+    bge_sparse_weights = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

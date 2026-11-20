@@ -1,100 +1,80 @@
 import asyncio
 import base64
-import ctypes
-import glob
 import io
 import os
 import re
-import sys
+import time
 import uuid
 import wave
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from google import genai
 from google.genai import types
+from sqlalchemy import desc
+
+from ai_core.rag.retriever import retrieve_hybrid_context
+from ai_core.router import TELEMETRY_STORE, get_ai_provider
+from auth.dependencies import resolve_ws_user_and_profile
+from clinical.drug_verifier import lookup_bd_drug
+from clinical.red_flag_gate import evaluate_text_red_flags
+from db.database import SessionLocal
+from db.models import ClinicalObservation, MedicationEpisode
 
 router = APIRouter()
 
-# Lazy-loaded singletons so server startup stays fast and models load once.
-_whisper_model: Optional[Any] = None
-_kokoro_model: Optional[Any] = None
-_model_lock = asyncio.Lock()
-
-LIVE_VOICE_MODE = os.getenv("LIVE_VOICE_MODE", "local").lower()
-
-KOKORO_MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "models", "kokoro", "kokoro-v1.0.onnx"
-)
-KOKORO_VOICES_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "models", "kokoro", "voices-v1.0.bin"
-)
-
-VOICE_MAP = {
-    "Aoede": "af_heart",
-    "Puck": "am_michael",
-    "Charon": "am_adam",
-    "Kore": "af_bella",
-    "Fenrir": "am_fenrir",
-}
-
 SAMPLE_RATE_IN = 16000
-SPEECH_RMS_THRESHOLD = 500.0
-SILENCE_DURATION_SEC = 0.8
+SILENCE_DURATION_SEC = 0.85
 MIN_UTTERANCE_SEC = 0.35
-BARGE_IN_DURATION_SEC = 0.25
+BARGE_IN_DURATION_SEC = 0.35
+
+_silero_model = None
+_silero_tried = False
 
 
-def _preload_cuda_libs() -> None:
-    """Preload venv NVIDIA cuBLAS/cuDNN shared libs so CTranslate2 finds them without LD_LIBRARY_PATH."""
-    nvidia_root = os.path.join(
-        sys.prefix, "lib", f"python{sys.version_info.major}.{sys.version_info.minor}", "site-packages", "nvidia"
-    )
-    for sub in ("cublas/lib/libcublas*.so*", "cudnn/lib/libcudnn*.so*"):
-        for lib_path in sorted(glob.glob(os.path.join(nvidia_root, sub))):
+def _get_silero_vad():
+    global _silero_model, _silero_tried
+    if _silero_tried:
+        return _silero_model
+    _silero_tried = True
+    try:
+        import silero_vad  # type: ignore
+
+        _silero_model = silero_vad.load_silero_vad()
+    except Exception:
+        _silero_model = None
+    return _silero_model
+
+
+class AdaptiveVad:
+    """Uses Silero VAD v5 when available; otherwise adaptive noise-floor RMS gate (fan/room resilient)."""
+
+    def __init__(self):
+        self.silero = _get_silero_vad()
+        self.noise_floor = 250.0
+        self.engine_name = "silero_vad_v5" if self.silero is not None else "adaptive_noise_floor"
+
+    def is_speech(self, pcm16: np.ndarray) -> bool:
+        if pcm16.size == 0:
+            return False
+        if self.silero is not None and pcm16.size >= 512:
             try:
-                ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
-            except OSError:
+                import torch  # type: ignore
+
+                f32 = pcm16[:512].astype(np.float32) / 32768.0
+                prob = float(self.silero(torch.from_numpy(f32), SAMPLE_RATE_IN).item())
+                return prob >= 0.58
+            except Exception:
                 pass
-
-
-async def _ensure_models() -> tuple[Any, Any]:
-    """Load faster-whisper (CUDA) and Kokoro ONNX once when in local mode."""
-    global _whisper_model, _kokoro_model
-    if LIVE_VOICE_MODE == "cloud":
-        return None, None
-    async with _model_lock:
-        if _whisper_model is None:
-            from faster_whisper import WhisperModel
-
-            def _load_whisper() -> WhisperModel:
-                _preload_cuda_libs()
-                try:
-                    print("Loading faster-whisper 'base' on CUDA...")
-                    return WhisperModel("base", device="cuda", compute_type="float16")
-                except Exception as exc:
-                    print(f"CUDA faster-whisper init failed ({exc}); falling back to CPU int8")
-                    return WhisperModel("base", device="cpu", compute_type="int8")
-
-            _whisper_model = await asyncio.to_thread(_load_whisper)
-            print("faster-whisper 'base' loaded.")
-
-        if _kokoro_model is None:
-            from kokoro_onnx import Kokoro
-
-            def _load_kokoro() -> Kokoro:
-                print(f"Loading Kokoro ONNX from {KOKORO_MODEL_PATH}...")
-                return Kokoro(KOKORO_MODEL_PATH, KOKORO_VOICES_PATH)
-
-            _kokoro_model = await asyncio.to_thread(_load_kokoro)
-            print("Kokoro ONNX loaded.")
-
-    return _whisper_model, _kokoro_model
+        rms = float(np.sqrt(np.mean(pcm16.astype(np.float32) ** 2)))
+        threshold = max(420.0, self.noise_floor * 2.4)
+        is_sp = rms >= threshold
+        if not is_sp:
+            self.noise_floor = 0.94 * self.noise_floor + 0.06 * min(rms, 600.0)
+        return is_sp
 
 
 def _pcm16_to_wav_bytes(pcm16: np.ndarray, sample_rate: int = SAMPLE_RATE_IN) -> bytes:
-    """Wrap raw PCM16 mono samples in a WAV container for Gemini audio input."""
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
@@ -104,249 +84,314 @@ def _pcm16_to_wav_bytes(pcm16: np.ndarray, sample_rate: int = SAMPLE_RATE_IN) ->
     return buf.getvalue()
 
 
-def _convert_tools(setup_tools: Optional[List[Dict[str, Any]]]) -> Optional[List[types.Tool]]:
-    """Convert Gemini Live setup functionDeclarations into google-genai Tool objects."""
-    if not setup_tools:
-        return None
-    declarations: List[types.FunctionDeclaration] = []
-    for tool_block in setup_tools:
-        for fd in tool_block.get("functionDeclarations", []):
-            declarations.append(
-                types.FunctionDeclaration(
-                    name=fd["name"],
-                    description=fd.get("description", ""),
-                    parameters=fd.get("parameters"),
-                )
-            )
-    return [types.Tool(function_declarations=declarations)] if declarations else None
-
-
 def _split_sentences(text: str) -> List[str]:
-    """Split response text into speakable chunks for low-latency TTS streaming."""
     cleaned = re.sub(r"\s+", " ", text).strip()
     if not cleaned:
         return []
-    parts = re.split(r"(?<=[.!?])\s+", cleaned)
+    parts = re.split(r"(?<=[.!?।])\s+", cleaned)
     return [p.strip() for p in parts if p.strip()]
+
+
+def _build_server_tools() -> List[types.Tool]:
+    return [
+        types.Tool(
+            function_declarations=[
+                types.FunctionDeclaration(
+                    name="search_patient_history",
+                    description=(
+                        "Search the patient's longitudinal medical history (prescriptions, lab reports, check-ins) "
+                        "using bilingual Bangla/Banglish/English hybrid RAG."
+                    ),
+                    parameters={
+                        "type": "OBJECT",
+                        "properties": {
+                            "query": {"type": "STRING", "description": "Clinical or Banglish question to retrieve"},
+                        },
+                        "required": ["query"],
+                    },
+                ),
+                types.FunctionDeclaration(
+                    name="lookup_bd_drug",
+                    description="Look up a Bangladeshi medication brand name or generic molecule in the DGDA catalog.",
+                    parameters={
+                        "type": "OBJECT",
+                        "properties": {
+                            "drug_name": {"type": "STRING", "description": "Brand or generic name e.g. Seclo, Bizoran, Comet"},
+                        },
+                        "required": ["drug_name"],
+                    },
+                ),
+                types.FunctionDeclaration(
+                    name="get_normalized_labs",
+                    description="Fetch the patient's most recent normalized lab values (mmol/L, mg/dL, HbA1c, eGFR) and active medications.",
+                    parameters={"type": "OBJECT", "properties": {}},
+                ),
+            ]
+        )
+    ]
 
 
 @router.websocket("/ws/live")
 async def live_voice_websocket(websocket: WebSocket):
-    """Gemini-Live-compatible WebSocket powered by local faster-whisper + Kokoro ONNX + Gemini REST."""
+    """Authenticated bilingual Bangla/Banglish/English Voice & Text Check-In WebSocket."""
     await websocket.accept()
 
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    client = genai.Client(api_key=api_key) if api_key else None
-    tts_client = (
-        genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
-        if api_key
-        else None
+    token = websocket.query_params.get("token")
+    profile_id = websocket.query_params.get("profile_id")
+
+    db = SessionLocal()
+    try:
+        user, profile = resolve_ws_user_and_profile(token, profile_id, db)
+        profile_uuid = profile.id
+        profile_name = profile.display_name
+        profile_conditions = list(profile.chronic_conditions or [])
+    except PermissionError as exc:
+        await websocket.send_json({"type": "error", "detail": str(exc)})
+        await websocket.close(code=4401)
+        db.close()
+        return
+
+    provider = get_ai_provider()
+    vad = AdaptiveVad()
+    tools = _build_server_tools()
+
+    system_instruction = (
+        f"You are MediTrackAI, a warm, empathetic bilingual health companion conducting a check-in for patient '{profile_name}' "
+        f"(known conditions: {', '.join(profile_conditions) or 'general wellness'}).\n"
+        "LANGUAGE & STYLE:\n"
+        "- The patient speaks Bangla, Banglish (mixed Bangla/English), or English. Reply naturally in the same language they use "
+        "(warm conversational Bangla or gentle Banglish/English) in 2-4 concise sentences.\n"
+        "- NEVER mention Hindi.\n"
+        "- Use the provided tools (search_patient_history, lookup_bd_drug, get_normalized_labs) whenever the patient asks about "
+        "their lab reports, sugar, pressure, creatinine, or Bangladeshi medicines (e.g. Seclo, Sergel, Bizoran, Comet, Napa).\n"
+        "- Never provide a definitive medical diagnosis or prescribe/change medication doses — summarize observations and suggest discussing with their doctor.\n"
+        "- If chest pain, breathing trouble, stroke symptoms, or severe bleeding are mentioned, immediately advise emergency ER care / Bangladesh 999."
     )
-    llm_model = os.getenv("GEMINI_LIVE_TEXT_MODEL", "gemini-3.8-flash")
-    tts_model = os.getenv("GEMINI_LIVE_TTS_MODEL", "gemini-2.5-flash-preview-tts")
 
-    system_instruction = "You are a helpful, empathetic medical assistant. Keep responses concise and conversational."
-    tools: Optional[List[types.Tool]] = None
-    kokoro_voice = "af_heart"
-    gemini_voice = "Aoede"
     history: List[types.Content] = []
-
     speech_chunks: List[np.ndarray] = []
+    ptt_chunks: List[np.ndarray] = []
+    ptt_active = False
     in_speech = False
     silence_samples = 0
     barge_in_samples = 0
     ai_task: Optional[asyncio.Task] = None
     ws_lock = asyncio.Lock()
+    voice_name = "Aoede"
 
     async def send_json(payload: Dict[str, Any]) -> None:
         async with ws_lock:
             await websocket.send_json(payload)
 
-    async def speak_text(text: str, kokoro: Any) -> None:
-        """Synthesize text sentence-by-sentence and stream 24kHz PCM16 chunks."""
-        for sentence in _split_sentences(text):
-            if LIVE_VOICE_MODE == "cloud":
-                if tts_client is None:
-                    return
-                tts_resp = await asyncio.to_thread(
-                    tts_client.models.generate_content,
-                    model=tts_model,
-                    contents=sentence,
-                    config=types.GenerateContentConfig(
-                        response_modalities=["AUDIO"],
-                        speech_config=types.SpeechConfig(
-                            voice_config=types.VoiceConfig(
-                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                    voice_name=gemini_voice
-                                )
-                            )
-                        ),
-                    ),
+    async def execute_server_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        tool_db = SessionLocal()
+        try:
+            if name == "search_patient_history":
+                query = str(args.get("query") or "recent health summary")
+                trace = await retrieve_hybrid_context(tool_db, profile_uuid, query, top_k=5)
+                citations = [h.citation for h in trace.hits]
+                await send_json(
+                    {
+                        "type": "tool_event",
+                        "tool": name,
+                        "args": args,
+                        "citations": citations,
+                        "latency_ms": trace.latency_ms,
+                    }
                 )
-                pcm_bytes = tts_resp.candidates[0].content.parts[0].inline_data.data
-                byte_chunk = 9600
-                for start in range(0, len(pcm_bytes), byte_chunk):
-                    b64 = base64.b64encode(pcm_bytes[start : start + byte_chunk]).decode("ascii")
-                    await send_json(
-                        {
-                            "serverContent": {
-                                "modelTurn": {
-                                    "parts": [
-                                        {
-                                            "inlineData": {
-                                                "mimeType": "audio/pcm",
-                                                "data": b64,
-                                            }
-                                        }
-                                    ]
-                                }
-                            }
-                        }
-                    )
-                continue
+                TELEMETRY_STORE.record_voice({"tool": name, "citations": citations, "latency_ms": trace.latency_ms})
+                return {
+                    "hits": [{"citation": h.citation, "text": h.chunk_text, "score": h.final_score} for h in trace.hits],
+                    "citations": citations,
+                }
 
-            samples, _sr = await asyncio.to_thread(
-                kokoro.create, sentence, voice=kokoro_voice, speed=1.0, lang="en-us"
-            )
-            pcm16 = np.clip(samples * 32767.0, -32768, 32767).astype(np.int16)
-            # Stream in ~200ms (4800 sample) chunks for smooth playback and fast barge-in
-            chunk_size = 4800
-            for start in range(0, len(pcm16), chunk_size):
-                chunk_bytes = pcm16[start : start + chunk_size].tobytes()
-                b64 = base64.b64encode(chunk_bytes).decode("ascii")
+            if name == "lookup_bd_drug":
+                dname = str(args.get("drug_name") or "")
+                matches = lookup_bd_drug(dname, tool_db, limit=3)
+                latency = round((time.perf_counter() - t0) * 1000, 1)
+                await send_json(
+                    {
+                        "type": "tool_event",
+                        "tool": name,
+                        "args": args,
+                        "citations": [f"[DGDA: {m['brand_name']} -> {m['generic_name']}]" for m in matches],
+                        "latency_ms": latency,
+                    }
+                )
+                return {"matches": matches}
+
+            if name == "get_normalized_labs":
+                obs = (
+                    tool_db.query(ClinicalObservation)
+                    .filter(ClinicalObservation.patient_profile_id == profile_uuid)
+                    .order_by(desc(ClinicalObservation.observed_at))
+                    .limit(12)
+                    .all()
+                )
+                meds = (
+                    tool_db.query(MedicationEpisode)
+                    .filter(MedicationEpisode.patient_profile_id == profile_uuid, MedicationEpisode.status == "active")
+                    .all()
+                )
+                latency = round((time.perf_counter() - t0) * 1000, 1)
+                await send_json(
+                    {
+                        "type": "tool_event",
+                        "tool": name,
+                        "args": {},
+                        "citations": [f"[Obs: {len(obs)} labs, {len(meds)} active meds]"],
+                        "latency_ms": latency,
+                    }
+                )
+                return {
+                    "recent_labs": [
+                        {
+                            "name": o.raw_name,
+                            "value": o.canonical_value,
+                            "unit": o.canonical_unit,
+                            "flag": o.flag,
+                            "date": o.observed_at.strftime("%Y-%m-%d") if o.observed_at else "",
+                        }
+                        for o in obs
+                    ],
+                    "active_medications": [
+                        {
+                            "brand": m.raw_brand_name,
+                            "generic": m.generic_name,
+                            "dosage": m.dosage,
+                            "frequency": m.frequency_bd,
+                        }
+                        for m in meds
+                    ],
+                }
+            return {"error": f"Unknown tool: {name}"}
+        finally:
+            tool_db.close()
+
+    async def speak_text(text: str) -> None:
+        for sentence in _split_sentences(text):
+            pcm_bytes = await provider.synthesize_speech_pcm24k(sentence, voice_name=voice_name)
+            if not pcm_bytes:
+                continue
+            byte_chunk = 9600
+            for start in range(0, len(pcm_bytes), byte_chunk):
+                b64 = base64.b64encode(pcm_bytes[start : start + byte_chunk]).decode("ascii")
                 await send_json(
                     {
                         "serverContent": {
                             "modelTurn": {
-                                "parts": [
-                                    {
-                                        "inlineData": {
-                                            "mimeType": "audio/pcm",
-                                            "data": b64,
-                                        }
-                                    }
-                                ]
+                                "parts": [{"inlineData": {"mimeType": "audio/pcm", "data": b64}}]
                             }
                         }
                     }
                 )
 
     async def process_turn(audio_pcm16: Optional[np.ndarray] = None, user_text: Optional[str] = None) -> None:
-        """Transcribe audio (or send directly in cloud mode), query Gemini Flash, handle tool calls, and speak response."""
         try:
-            whisper, kokoro = await _ensure_models()
-
+            asr_label = "text_input"
             if user_text is None and audio_pcm16 is not None:
-                if LIVE_VOICE_MODE == "cloud":
-                    wav_bytes = _pcm16_to_wav_bytes(audio_pcm16, SAMPLE_RATE_IN)
-                    history.append(
-                        types.Content(
-                            role="user",
-                            parts=[
-                                types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
-                                types.Part.from_text(text="Listen to the user's audio and respond."),
-                            ],
-                        )
-                    )
-                else:
-                    audio_f32 = audio_pcm16.astype(np.float32) / 32768.0
+                wav_bytes = _pcm16_to_wav_bytes(audio_pcm16, SAMPLE_RATE_IN)
+                user_text, asr_label = await provider.transcribe_audio_bytes(wav_bytes, is_wav=True)
+                if not user_text:
+                    await send_json({"serverContent": {"turnComplete": True}})
+                    return
 
-                    def _transcribe() -> str:
-                        segments, _info = whisper.transcribe(
-                            audio_f32, beam_size=1, vad_filter=True
-                        )
-                        return " ".join(seg.text.strip() for seg in segments).strip()
-
-                    user_text = await asyncio.to_thread(_transcribe)
-                    if not user_text:
-                        return
-                    print(f"[LiveWS] User: {user_text}")
-                    history.append(
-                        types.Content(role="user", parts=[types.Part.from_text(text=user_text)])
-                    )
-            elif user_text:
-                print(f"[LiveWS] User: {user_text}")
-                history.append(
-                    types.Content(role="user", parts=[types.Part.from_text(text=user_text)])
-                )
-            else:
+            if not user_text:
                 return
 
-            if client is None:
-                reply = "Gemini API key is not configured on the backend."
-                await speak_text(reply, kokoro)
-                await send_json({"serverContent": {"turnComplete": True}})
-                return
+            await send_json({"type": "transcript", "role": "user", "text": user_text, "asr_engine": asr_label})
 
-            config = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                tools=tools,
-                temperature=0.7,
-            )
+            # Red-flag deterministic safety check + Local PII redaction
+            red_flags = evaluate_text_red_flags(user_text)
+            if red_flags:
+                await send_json({"type": "red_flag", "alerts": red_flags})
 
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=llm_model,
-                contents=history,
-                config=config,
-            )
+            pii_res = await provider.redact_pii(user_text)
+            TELEMETRY_STORE.record_pii(pii_res.model_dump())
+            await send_json({"type": "pii_diff", **pii_res.model_dump()})
 
-            if response.function_calls:
-                fc_payload = []
-                for fc in response.function_calls:
-                    fc_payload.append(
-                        {
-                            "name": fc.name,
-                            "args": dict(fc.args) if fc.args else {},
-                            "id": getattr(fc, "id", None) or str(uuid.uuid4()),
-                        }
-                    )
-                await send_json(
-                    {"serverContent": {"modelTurn": {"functionCalls": fc_payload}}}
+            # Feed redacted text to LLM conversation history
+            history.append(types.Content(role="user", parts=[types.Part.from_text(text=pii_res.redacted_text)]))
+
+            # Multi-step server-side tool loop (up to 3 hops)
+            response = None
+            for _ in range(3):
+                response = await provider.generate_text(
+                    contents=history,
+                    system_instruction=system_instruction,
+                    tools=tools,
+                    fast=True,
                 )
+                fcs = getattr(response, "function_calls", None) or []
+                if not fcs:
+                    break
+                # Append model's tool call message
+                if response.candidates and response.candidates[0].content:
+                    history.append(response.candidates[0].content)
+                tool_parts: List[types.Part] = []
+                for fc in fcs:
+                    res_data = await execute_server_tool(fc.name, dict(fc.args) if fc.args else {})
+                    tool_parts.append(types.Part.from_function_response(name=fc.name, response=res_data))
+                history.append(types.Content(role="user", parts=tool_parts))
 
-            reply_text = (response.text or "").strip()
+            reply_text = (getattr(response, "text", None) or "").strip()
+            if not reply_text and red_flags:
+                reply_text = f"Emergency warning: {red_flags[0]['title']}. {red_flags[0]['action']}"
+
             if reply_text:
-                print(f"[LiveWS] AI: {reply_text}")
-                history.append(
-                    types.Content(role="model", parts=[types.Part.from_text(text=reply_text)])
-                )
-                await speak_text(reply_text, kokoro)
+                history.append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
+                await send_json({"type": "transcript", "role": "assistant", "text": reply_text})
+                await speak_text(reply_text)
 
             await send_json({"serverContent": {"turnComplete": True}})
-
         except asyncio.CancelledError:
-            print("[LiveWS] AI turn cancelled (barge-in)")
             raise
         except Exception as exc:
-            print(f"[LiveWS] Turn error: {exc}")
+            await send_json({"type": "error", "detail": str(exc)})
             await send_json({"serverContent": {"turnComplete": True}})
 
     try:
+        await send_json({"type": "ready", "profile": profile_name, "vad_engine": vad.engine_name, "mode": provider.mode_name})
         while True:
             msg = await websocket.receive_json()
 
             if "setup" in msg:
                 setup = msg["setup"] or {}
-                sys_parts = setup.get("system_instruction", {}).get("parts", [])
-                if sys_parts and sys_parts[0].get("text"):
-                    system_instruction = sys_parts[0]["text"]
-
-                tools = _convert_tools(setup.get("tools"))
-
-                voice_name = (
+                vn = (
                     setup.get("generation_config", {})
                     .get("speech_config", {})
                     .get("voice_config", {})
                     .get("prebuilt_voice_config", {})
                     .get("voice_name")
                 )
-                if voice_name in VOICE_MAP:
-                    kokoro_voice = VOICE_MAP[voice_name]
-                    gemini_voice = voice_name
-
-                await _ensure_models()
+                if vn:
+                    voice_name = vn
                 await send_json({"setupComplete": {}})
+                continue
+
+            if msg.get("type") == "ptt_start":
+                ptt_active = True
+                ptt_chunks = []
+                if ai_task and not ai_task.done():
+                    ai_task.cancel()
+                continue
+
+            if msg.get("type") == "ptt_end":
+                ptt_active = False
+                if ptt_chunks:
+                    full_audio = np.concatenate(ptt_chunks)
+                    ptt_chunks = []
+                    if full_audio.size >= int(0.2 * SAMPLE_RATE_IN):
+                        ai_task = asyncio.create_task(process_turn(audio_pcm16=full_audio))
+                continue
+
+            if msg.get("type") == "text_input":
+                txt = str(msg.get("text") or "").strip()
+                if txt:
+                    if ai_task and not ai_task.done():
+                        ai_task.cancel()
+                    ai_task = asyncio.create_task(process_turn(user_text=txt))
                 continue
 
             if "realtime_input" in msg:
@@ -355,15 +400,15 @@ async def live_voice_websocket(websocket: WebSocket):
                     b64_data = chunk.get("data")
                     if not b64_data:
                         continue
-                    raw = base64.b64decode(b64_data)
-                    pcm = np.frombuffer(raw, dtype=np.int16)
+                    pcm = np.frombuffer(base64.b64decode(b64_data), dtype=np.int16)
                     if pcm.size == 0:
                         continue
 
-                    rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
-                    is_loud = rms >= SPEECH_RMS_THRESHOLD
+                    if ptt_active:
+                        ptt_chunks.append(pcm)
+                        continue
 
-                    # Barge-in if AI is currently speaking
+                    is_loud = vad.is_speech(pcm)
                     if ai_task is not None and not ai_task.done():
                         if is_loud:
                             barge_in_samples += pcm.size
@@ -407,11 +452,12 @@ async def live_voice_websocket(websocket: WebSocket):
                     ]
                     combined = " ".join(texts).strip()
                     if combined:
-                        if ai_task is not None and not ai_task.done():
+                        if ai_task and not ai_task.done():
                             ai_task.cancel()
                         ai_task = asyncio.create_task(process_turn(user_text=combined))
 
     except WebSocketDisconnect:
-        if ai_task is not None and not ai_task.done():
+        if ai_task and not ai_task.done():
             ai_task.cancel()
-        print("[LiveWS] Client disconnected")
+    finally:
+        db.close()

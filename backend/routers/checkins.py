@@ -1,157 +1,160 @@
-#/routers/checkins.py
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from pydantic import BaseModel
 from sqlalchemy import desc
-from db.database import SessionLocal
-from db.models import CheckIn
-from typing import List
-import json
-import traceback
+from sqlalchemy.orm import Session
+
+from ai_core.rag.indexer import index_knowledge_chunk
+from ai_core.router import TELEMETRY_STORE, get_ai_provider
+from ai_core.schemas import CheckInSummaryOutput
+from auth.dependencies import get_active_profile
+from clinical.red_flag_gate import evaluate_text_red_flags
+from db.database import get_db
+from db.models import CheckIn, PatientProfile
 
 router = APIRouter(prefix="/checkins", tags=["checkins"])
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
-def safe_parse_json(data, default=None):
-    """Safely parse JSON data"""
-    if default is None:
-        default = []
-    
-    if data is None:
-        return default
-    if isinstance(data, list):
-        return data
-    if isinstance(data, str):
-        try:
-            return json.loads(data)
-        except (json.JSONDecodeError, ValueError):
-            return default
-    if isinstance(data, dict):
-        return data
-    return default
+class TurnItem(BaseModel):
+    role: str
+    text: str
+
+
+class FinalizeCheckInRequest(BaseModel):
+    turns: List[TurnItem]
+
+
+@router.post("/finalize")
+async def finalize_checkin(
+    req: FinalizeCheckInRequest,
+    profile: PatientProfile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
+):
+    if not req.turns:
+        raise HTTPException(status_code=400, detail="No conversation turns provided")
+
+    raw_text = "\n".join(f"{t.role}: {t.text}" for t in req.turns)
+    provider = get_ai_provider()
+    pii_res = await provider.redact_pii(raw_text)
+    TELEMETRY_STORE.record_pii(pii_res.model_dump())
+    red_flags = evaluate_text_red_flags(raw_text)
+
+    prompt = (
+        "Summarize this bilingual (Bangla/Banglish/English) patient health check-in into concise clinical English JSON.\n"
+        "Extract summary, mood, symptoms, medications_taken, sleep_quality, energy_level, concerns, "
+        "non-diagnostic ai_insights (self-care or questions for doctor), language_detected, and overall_score "
+        "which MUST be one of: 'positive', 'neutral', or 'negative'.\n\n"
+        f"Redacted Conversation:\n{pii_res.redacted_text}"
+    )
+    summary_obj = await provider.generate_structured(prompt, CheckInSummaryOutput, fast=True)
+
+    checkin = CheckIn(
+        patient_profile_id=profile.id,
+        transcript={"turns": [t.model_dump() for t in req.turns]},
+        pii_redacted_transcript={"redacted_text": pii_res.redacted_text, "engine": pii_res.engine},
+        summary=summary_obj.summary,
+        mood=summary_obj.mood,
+        symptoms=summary_obj.symptoms,
+        medications_mentioned=summary_obj.medications_taken,
+        sleep_quality=summary_obj.sleep_quality,
+        energy_level=summary_obj.energy_level,
+        concerns=summary_obj.concerns,
+        ai_insights=summary_obj.ai_insights,
+        red_flags_detected=red_flags,
+        overall_score=summary_obj.overall_score,
+        language_detected=summary_obj.language_detected,
+    )
+    db.add(checkin)
+    db.commit()
+    db.refresh(checkin)
+
+    chunk_text = (
+        f"Check-In ({checkin.created_at.strftime('%Y-%m-%d')}): {checkin.summary} "
+        f"Symptoms: {', '.join(checkin.symptoms or [])}. Medications mentioned: {', '.join(checkin.medications_mentioned or [])}."
+    )
+    await index_knowledge_chunk(
+        db=db,
+        patient_profile_id=profile.id,
+        source_type="checkin",
+        source_id=str(checkin.id),
+        chunk_text=chunk_text,
+        event_at=checkin.created_at or datetime.now(timezone.utc),
+        language=checkin.language_detected or "bn-en",
+    )
+
+    return {
+        "success": True,
+        "id": checkin.id,
+        "summary": summary_obj.model_dump(),
+        "red_flags": red_flags,
+        "pii_redaction": pii_res.model_dump(),
+    }
+
 
 @router.get("/summaries")
 def get_checkin_summaries(
-    limit: int = Query(default=10, ge=1, le=100),
-    db: Session = Depends(get_db)
+    limit: int = Query(default=20, ge=1, le=100),
+    profile: PatientProfile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
 ):
-    """
-    Get all check-in summaries, ordered by most recent first
-    """
-    try:
-        print("Fetching check-ins from database...")
-        checkins = db.query(CheckIn).order_by(desc(CheckIn.timestamp)).limit(limit).all()
-        print(f"Found {len(checkins)} check-ins")
-        
-        summaries = []
-        for i, checkin in enumerate(checkins):
-            try:
-                print(f"\nProcessing check-in {i+1}/{len(checkins)} (ID: {checkin.id})")
-                
-                # Safely parse each field
-                symptoms = safe_parse_json(checkin.symptoms, [])
-                medications = safe_parse_json(checkin.medications_taken, [])
-                concerns = safe_parse_json(checkin.concerns, [])
-                ai_insights = safe_parse_json(checkin.ai_insights, [])
-                
-                # Handle summary - it might be a dict or string
-                summary_text = ""
-                if isinstance(checkin.summary, dict):
-                    summary_text = checkin.summary.get("summary", "") or str(checkin.summary)
-                elif isinstance(checkin.summary, str):
-                    summary_text = checkin.summary
-                elif checkin.summary:
-                    summary_text = str(checkin.summary)
-                
-                print(f"Check-in {checkin.id} - Mood: {checkin.mood}, Score: {checkin.overall_score}")
-                
-                summaries.append({
-                    "id": checkin.id,
-                    "timestamp": checkin.timestamp.isoformat() if checkin.timestamp else None,
-                    "summary": summary_text,
-                    "mood": checkin.mood or "",
-                    "symptoms": symptoms,
-                    "medications_taken": medications,
-                    "sleep_quality": checkin.sleep_quality or "",
-                    "energy_level": checkin.energy_level or "",
-                    "concerns": concerns,
-                    "ai_insights": ai_insights,
-                    "overall_score": checkin.overall_score or ""
-                })
-                
-            except Exception as e:
-                print(f"Error processing check-in {checkin.id}: {str(e)}")
-                print(f"Traceback: {traceback.format_exc()}")
-                # Continue processing other check-ins instead of failing completely
-                continue
-        
-        print(f"\nSuccessfully processed {len(summaries)} check-ins")
-        
-        return {
-            "success": True,
-            "count": len(summaries),
-            "checkins": summaries
-        }
-    
-    except Exception as e:
-        print(f"Error in get_checkin_summaries: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error fetching check-ins: {str(e)}")
+    checkins = (
+        db.query(CheckIn)
+        .filter(CheckIn.patient_profile_id == profile.id)
+        .order_by(desc(CheckIn.created_at))
+        .limit(limit)
+        .all()
+    )
+    return {
+        "success": True,
+        "count": len(checkins),
+        "checkins": [
+            {
+                "id": c.id,
+                "timestamp": c.created_at.isoformat() if c.created_at else None,
+                "summary": c.summary or "",
+                "mood": c.mood or "Neutral",
+                "symptoms": c.symptoms or [],
+                "medications_taken": c.medications_mentioned or [],
+                "sleep_quality": c.sleep_quality or "",
+                "energy_level": c.energy_level or "",
+                "concerns": c.concerns or [],
+                "ai_insights": c.ai_insights or [],
+                "red_flags_detected": c.red_flags_detected or [],
+                "overall_score": c.overall_score or "neutral",
+                "language_detected": c.language_detected or "bn-en",
+            }
+            for c in checkins
+        ],
+    }
+
 
 @router.get("/{checkin_id}")
 def get_checkin_detail(
     checkin_id: int,
-    db: Session = Depends(get_db)
+    profile: PatientProfile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
 ):
-    """
-    Get detailed information for a specific check-in including transcript
-    """
-    try:
-        checkin = db.query(CheckIn).filter(CheckIn.id == checkin_id).first()
-        
-        if not checkin:
-            raise HTTPException(status_code=404, detail="Check-in not found")
-        
-        # Safely parse JSON fields
-        symptoms = safe_parse_json(checkin.symptoms, [])
-        medications = safe_parse_json(checkin.medications_taken, [])
-        concerns = safe_parse_json(checkin.concerns, [])
-        ai_insights = safe_parse_json(checkin.ai_insights, [])
-        transcript = safe_parse_json(checkin.transcript, {})
-        
-        # Handle summary
-        summary_text = ""
-        if isinstance(checkin.summary, dict):
-            summary_text = checkin.summary.get("summary", "") or str(checkin.summary)
-        elif isinstance(checkin.summary, str):
-            summary_text = checkin.summary
-        elif checkin.summary:
-            summary_text = str(checkin.summary)
-        
-        return {
-            "id": checkin.id,
-            "timestamp": checkin.timestamp.isoformat() if checkin.timestamp else None,
-            "audio_path": checkin.audio_path,
-            "transcript": transcript,
-            "summary": summary_text,
-            "mood": checkin.mood or "",
-            "symptoms": symptoms,
-            "medications_taken": medications,
-            "sleep_quality": checkin.sleep_quality or "",
-            "energy_level": checkin.energy_level or "",
-            "concerns": concerns,
-            "ai_insights": ai_insights,
-            "overall_score": checkin.overall_score or ""
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error in get_checkin_detail: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error fetching check-in: {str(e)}")
+    c = (
+        db.query(CheckIn)
+        .filter(CheckIn.id == checkin_id, CheckIn.patient_profile_id == profile.id)
+        .first()
+    )
+    if not c:
+        raise HTTPException(status_code=404, detail="Check-in not found")
+    return {
+        "id": c.id,
+        "timestamp": c.created_at.isoformat() if c.created_at else None,
+        "transcript": c.transcript or {},
+        "pii_redacted_transcript": c.pii_redacted_transcript or {},
+        "summary": c.summary or "",
+        "mood": c.mood or "",
+        "symptoms": c.symptoms or [],
+        "medications_taken": c.medications_mentioned or [],
+        "sleep_quality": c.sleep_quality or "",
+        "energy_level": c.energy_level or "",
+        "concerns": c.concerns or [],
+        "ai_insights": c.ai_insights or [],
+        "red_flags_detected": c.red_flags_detected or [],
+        "overall_score": c.overall_score or "neutral",
+    }

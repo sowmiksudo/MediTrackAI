@@ -1,199 +1,225 @@
-# routers/prescriptions.py
-from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
-from sqlalchemy.orm import Session
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import desc
-from typing import Dict, Any
+from sqlalchemy.orm import Session
+
+from ai_core.rag.indexer import index_knowledge_chunk
+from auth.dependencies import get_active_profile
+from auth.security import sign_upload_path
+from clinical.drug_verifier import verify_medicines
 from db.database import get_db
-from db.models import Prescription
-from schemas import PrescriptionSchema
-from marshmallow import ValidationError
-import json
-import traceback
+from db.models import MedicationEpisode, PatientProfile, Prescription
 
 router = APIRouter(prefix="/api/prescriptions", tags=["prescriptions"])
-schema = PrescriptionSchema()
-schemas = PrescriptionSchema(many=True)
 
 
-def safe_parse_json(data, default=None):
-    """Safely parse JSON data"""
-    if default is None:
-        default = []
-    
-    if data is None:
-        return default
-    if isinstance(data, list):
-        return data
-    if isinstance(data, str):
-        try:
-            return json.loads(data)
-        except (json.JSONDecodeError, ValueError):
-            return default
-    if isinstance(data, dict):
-        return data
-    return default
+class ConfirmMedicineItem(BaseModel):
+    name: str
+    dosage: Optional[str] = ""
+    frequency: Optional[str] = ""
+    duration: Optional[str] = ""
+    special_instructions: Optional[str] = ""
 
 
-# IMPORTANT: /summaries must be defined BEFORE /{prescription_id} to avoid route conflicts
+class ConfirmPrescriptionRequest(BaseModel):
+    medicines: List[ConfirmMedicineItem]
+    diagnosis: Optional[str] = None
+
+
 @router.get("/summaries")
 def get_prescription_summaries(
     limit: int = Query(default=20, ge=1, le=100),
-    db: Session = Depends(get_db)
+    profile: PatientProfile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
 ):
-    """
-    Get all prescription summaries, ordered by most recent first
-    """
-    try:
-        print("Fetching prescriptions from database...")
-        prescriptions = db.query(Prescription).order_by(desc(Prescription.timestamp)).limit(limit).all()
-        print(f"Found {len(prescriptions)} prescriptions")
-        
-        summaries = []
-        for i, prescription in enumerate(prescriptions):
-            try:
-                print(f"\nProcessing prescription {i+1}/{len(prescriptions)} (ID: {prescription.id})")
-                
-                # Safely parse JSON fields
-                medicines = safe_parse_json(prescription.medicines, [])
-                structured_data = safe_parse_json(prescription.structured_data, {})
-                
-                # Extract summary text
-                summary_text = prescription.prescription_summary or ""
-                
-                print(f"Prescription {prescription.id} - Doctor: {prescription.doctor_name}, Date: {prescription.prescription_date}")
-                
-                summaries.append({
-                    "id": prescription.id,
-                    "timestamp": prescription.timestamp.isoformat() if prescription.timestamp else None,
-                    "prescription_date": prescription.prescription_date or "",
-                    "doctor_name": prescription.doctor_name or "",
-                    "doctor_qualification": prescription.doctor_qualification or "",
-                    "doctor_registration_number": prescription.doctor_registration_number or "",
-                    "hospital": prescription.hospital or "",
-                    "doctor_contact_info": prescription.doctor_contact_info or "",
-                    "patient_name": prescription.patient_name or "",
-                    "patient_age": prescription.patient_age or "",
-                    "patient_gender": prescription.patient_gender or "",
-                    "medicines": medicines,
-                    "diagnosis": prescription.diagnosis or "",
-                    "symptoms": prescription.symptoms or "",
-                    "advice": prescription.advice or "",
-                    "follow_up": prescription.follow_up or "",
-                    "prescription_summary": summary_text,
-                    "file_path": prescription.file_path or ""
-                })
-                
-            except Exception as e:
-                print(f"Error processing prescription {prescription.id}: {str(e)}")
-                print(f"Traceback: {traceback.format_exc()}")
-                continue
-        
-        print(f"\nSuccessfully processed {len(summaries)} prescriptions")
-        
-        return {
-            "success": True,
-            "count": len(summaries),
-            "prescriptions": summaries
-        }
-    
-    except Exception as e:
-        print(f"Error in get_prescription_summaries: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error fetching prescriptions: {str(e)}")
+    rows = (
+        db.query(Prescription)
+        .filter(Prescription.patient_profile_id == profile.id)
+        .order_by(desc(Prescription.created_at))
+        .limit(limit)
+        .all()
+    )
+    items = []
+    for p in rows:
+        ext = p.extracted_json or {}
+        eps = (
+            db.query(MedicationEpisode)
+            .filter(MedicationEpisode.prescription_id == p.id)
+            .all()
+        )
+        meds_out = [
+            {
+                "id": ep.id,
+                "brand_name": ep.raw_brand_name,
+                "generic_name": ep.generic_name,
+                "drug_class": ep.drug_class,
+                "dosage": ep.dosage,
+                "frequency_bd": ep.frequency_bd,
+                "special_instructions": ep.special_instructions,
+                "confidence": ep.match_confidence,
+                "needs_user_confirm": ep.needs_user_confirm,
+                "status": ep.status,
+            }
+            for ep in eps
+        ] or ext.get("medicines", [])
+
+        sig = sign_upload_path(p.file_path)
+        items.append(
+            {
+                "id": p.id,
+                "timestamp": p.created_at.isoformat() if p.created_at else None,
+                "prescription_date": p.doc_date or "",
+                "doctor_name": p.doctor_name or "",
+                "doctor_qualification": p.doctor_qualification or "",
+                "doctor_bmdc_reg": p.doctor_bmdc_reg or "",
+                "hospital": p.hospital or "",
+                "diagnosis": p.diagnosis or "",
+                "symptoms": ext.get("symptoms") or "",
+                "advice": ext.get("advice") or "",
+                "follow_up": ext.get("follow_up") or "",
+                "prescription_summary": p.prescription_summary or "",
+                "verification_status": p.verification_status,
+                "overall_confidence": p.overall_confidence,
+                "ddi_alerts": p.ddi_alerts or [],
+                "medicines": meds_out,
+                "file_url": f"/uploads/{p.file_path.lstrip('/')}?{sig}",
+            }
+        )
+    return {"success": True, "count": len(items), "prescriptions": items}
 
 
-@router.get("", response_model=dict)
-def get_all_prescriptions(db: Session = Depends(get_db)):
-    """Get all prescriptions"""
-    prescriptions = db.query(Prescription).all()
-    return {"data": schemas.dump(prescriptions)}
+@router.get("/medications/active")
+def get_active_medications(
+    profile: PatientProfile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
+):
+    eps = (
+        db.query(MedicationEpisode)
+        .filter(MedicationEpisode.patient_profile_id == profile.id)
+        .order_by(desc(MedicationEpisode.started_at))
+        .all()
+    )
+    return {
+        "medications": [
+            {
+                "id": e.id,
+                "prescription_id": e.prescription_id,
+                "brand_name": e.raw_brand_name,
+                "generic_name": e.generic_name,
+                "drug_class": e.drug_class,
+                "dosage": e.dosage,
+                "frequency_bd": e.frequency_bd,
+                "confidence": e.match_confidence,
+                "needs_user_confirm": e.needs_user_confirm,
+                "status": e.status,
+                "started_at": e.started_at.isoformat() if e.started_at else None,
+            }
+            for e in eps
+        ]
+    }
 
 
 @router.get("/{prescription_id}")
-def get_prescription(prescription_id: int, db: Session = Depends(get_db)):
-    """Get prescription by ID with full details"""
-    try:
-        prescription = db.query(Prescription).filter(Prescription.id == prescription_id).first()
-        if not prescription:
-            raise HTTPException(status_code=404, detail="Prescription not found")
-        
-        # Safely parse JSON fields
-        medicines = safe_parse_json(prescription.medicines, [])
-        structured_data = safe_parse_json(prescription.structured_data, {})
-        
-        return {
-            "id": prescription.id,
-            "timestamp": prescription.timestamp.isoformat() if prescription.timestamp else None,
-            "file_path": prescription.file_path or "",
-            "ocr_text": prescription.ocr_text or "",
-            "prescription_date": prescription.prescription_date or "",
-            "doctor_name": prescription.doctor_name or "",
-            "doctor_qualification": prescription.doctor_qualification or "",
-            "doctor_registration_number": prescription.doctor_registration_number or "",
-            "hospital": prescription.hospital or "",
-            "doctor_contact_info": prescription.doctor_contact_info or "",
-            "patient_name": prescription.patient_name or "",
-            "patient_age": prescription.patient_age or "",
-            "patient_gender": prescription.patient_gender or "",
-            "medicines": medicines,
-            "diagnosis": prescription.diagnosis or "",
-            "symptoms": prescription.symptoms or "",
-            "advice": prescription.advice or "",
-            "follow_up": prescription.follow_up or "",
-            "prescription_summary": prescription.prescription_summary or "",
-            "structured_data": structured_data
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error in get_prescription: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error fetching prescription: {str(e)}")
-
-
-@router.post("", response_model=dict, status_code=status.HTTP_201_CREATED)
-def create_prescription(prescription_data: Dict[Any, Any] = Body(...), db: Session = Depends(get_db)):
-    """Create a new prescription"""
-    try:
-        validated_data = schema.load(prescription_data)
-    except ValidationError as err:
-        raise HTTPException(status_code=400, detail=err.messages)
-    
-    prescription = Prescription(**validated_data)
-    db.add(prescription)
-    db.commit()
-    db.refresh(prescription)
-    return {"data": schema.dump(prescription), "message": "Prescription created successfully"}
-
-
-@router.put("/{prescription_id}", response_model=dict)
-def update_prescription(prescription_id: int, prescription_data: Dict[Any, Any] = Body(...), db: Session = Depends(get_db)):
-    """Update a prescription"""
-    prescription = db.query(Prescription).filter(Prescription.id == prescription_id).first()
-    if not prescription:
+def get_prescription(
+    prescription_id: int,
+    profile: PatientProfile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
+):
+    p = (
+        db.query(Prescription)
+        .filter(Prescription.id == prescription_id, Prescription.patient_profile_id == profile.id)
+        .first()
+    )
+    if not p:
         raise HTTPException(status_code=404, detail="Prescription not found")
-    
-    try:
-        validated_data = schema.load(prescription_data, partial=True)
-    except ValidationError as err:
-        raise HTTPException(status_code=400, detail=err.messages)
-    
-    for key, value in validated_data.items():
-        setattr(prescription, key, value)
-    
-    db.commit()
-    db.refresh(prescription)
-    return {"data": schema.dump(prescription), "message": "Prescription updated successfully"}
+    sig = sign_upload_path(p.file_path)
+    return {
+        "id": p.id,
+        "timestamp": p.created_at.isoformat() if p.created_at else None,
+        "doc_date": p.doc_date,
+        "doctor_name": p.doctor_name,
+        "hospital": p.hospital,
+        "diagnosis": p.diagnosis,
+        "raw_ocr_text": p.raw_ocr_text,
+        "prescription_summary": p.prescription_summary,
+        "verification_status": p.verification_status,
+        "overall_confidence": p.overall_confidence,
+        "ddi_alerts": p.ddi_alerts or [],
+        "extracted_json": p.extracted_json or {},
+        "file_url": f"/uploads/{p.file_path.lstrip('/')}?{sig}",
+    }
 
 
-@router.delete("/{prescription_id}", response_model=dict)
-def delete_prescription(prescription_id: int, db: Session = Depends(get_db)):
-    """Delete a prescription"""
-    prescription = db.query(Prescription).filter(Prescription.id == prescription_id).first()
-    if not prescription:
+@router.post("/{prescription_id}/confirm")
+async def confirm_prescription(
+    prescription_id: int,
+    req: ConfirmPrescriptionRequest,
+    profile: PatientProfile = Depends(get_active_profile),
+    db: Session = Depends(get_db),
+):
+    p = (
+        db.query(Prescription)
+        .filter(Prescription.id == prescription_id, Prescription.patient_profile_id == profile.id)
+        .first()
+    )
+    if not p:
         raise HTTPException(status_code=404, detail="Prescription not found")
-    
-    db.delete(prescription)
+
+    # Remove old episodes for this Rx before re-verifying against other active meds
+    db.query(MedicationEpisode).filter(MedicationEpisode.prescription_id == p.id).delete()
     db.commit()
-    return {"message": "Prescription deleted successfully"}
+
+    verification = verify_medicines([m.model_dump() for m in req.medicines], db, patient_profile_id=profile.id)
+
+    for item in verification["medicines"]:
+        db.add(
+            MedicationEpisode(
+                patient_profile_id=profile.id,
+                prescription_id=p.id,
+                raw_brand_name=item["raw_name"],
+                matched_drug_id=item["matched_drug_id"],
+                generic_name=item["generic_name"],
+                drug_class=item["drug_class"],
+                dosage=item["dosage"],
+                frequency_bd=item["frequency_bd"],
+                special_instructions=item["special_instructions"],
+                match_confidence=item["confidence"],
+                needs_user_confirm=False,
+                status="active",
+            )
+        )
+
+    if req.diagnosis is not None:
+        p.diagnosis = req.diagnosis
+    p.verification_status = "confirmed"
+    p.overall_confidence = verification["overall_confidence"]
+    p.ddi_alerts = verification["ddi_alerts"]
+    ext = dict(p.extracted_json or {})
+    ext["medicines"] = verification["medicines"]
+    ext["ddi_alerts"] = verification["ddi_alerts"]
+    p.extracted_json = ext
+    db.commit()
+
+    med_lines = ", ".join(
+        f"{m['brand_name']} ({m['generic_name'] or 'custom'}) {m['dosage']} {m['frequency_bd']}"
+        for m in verification["medicines"]
+    )
+    await index_knowledge_chunk(
+        db=db,
+        patient_profile_id=profile.id,
+        source_type="prescription",
+        source_id=str(p.id),
+        chunk_text=f"Confirmed Prescription ({p.doc_date or 'N/A'}) by {p.doctor_name or 'Doctor'}: {med_lines}. Diagnosis: {p.diagnosis or 'N/A'}.",
+        event_at=p.created_at or datetime.now(timezone.utc),
+        language="en",
+    )
+
+    return {
+        "success": True,
+        "prescription_id": p.id,
+        "verification_status": p.verification_status,
+        "medicines": verification["medicines"],
+        "ddi_alerts": verification["ddi_alerts"],
+    }

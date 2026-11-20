@@ -1,27 +1,23 @@
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-import os
-from dotenv import load_dotenv
+from sqlalchemy.orm import declarative_base, sessionmaker
+from ai_core.config import get_settings
 
-load_dotenv()
+settings = get_settings()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/meditrack")
-
-engine = create_engine(DATABASE_URL)
+engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
 Base = declarative_base()
 
+
 def get_db():
-    """Dependency to get database session"""
+    """Dependency to get database session."""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-def init_db():
-    """Initialize database tables"""
-    Base.metadata.create_all(bind=engine)
 
+def init_db():
+    """Initialize database tables when running without Alembic."""
+    Base.metadata.create_all(bind=engine)

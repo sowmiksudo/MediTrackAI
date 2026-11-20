@@ -1,0 +1,22 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: meditrack-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-meditrack}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-meditrack}
+      POSTGRES_DB: ${POSTGRES_DB:-meditrack}
+    ports:
+      - "${PG_PORT:-5433}:5432"
+    volumes:
+      - meditrack_pgdata:/var/lib/postgresql/data
+      - ./backend/db/init_extensions.sql:/docker-entrypoint-initdb.d/init_extensions.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-meditrack} -d ${POSTGRES_DB:-meditrack}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  meditrack_pgdata:

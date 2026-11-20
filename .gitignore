@@ -1,0 +1,16 @@
+*.pyc
+__pycache__/
+.env
+.env.*
+!.env.example
+backend/credentials.json
+backend/token.json
+backend/uploads/
+backend/models/
+*.onnx
+*.gguf
+venv/
+adk-venv/
+node_modules/
+dist/
+.adk/

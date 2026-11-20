@@ -1,289 +1,457 @@
-import { useState, useCallback } from "react";
-import { Card } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Upload, File, X, CheckCircle2 } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { useState } from "react";
+import { AlertTriangle, Camera, CheckCircle2, FileText, Loader2, Plus, Search, Trash2, Upload as UploadIcon } from "lucide-react";
 import { toast } from "sonner";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
+import { useAuth } from "@/context/AuthContext";
+import { apiFetch, BACKEND_URL, getStoredProfileId, getStoredToken, JobProgressEvent, subscribeJobProgress } from "@/lib/api";
 
-interface UploadedFile {
-  id: string;
-  name: string;
-  size: number;
-  type: string;
-  file: File;
+interface VerifiedMed {
+  raw_name: string;
+  brand_name: string;
+  generic_name?: string | null;
+  dosage: string;
+  frequency_bd: string;
+  duration: string;
+  special_instructions: string;
+  indicative_price_bdt?: number | null;
+  confidence: number;
+  confidence_tier: string;
+  needs_user_confirm: boolean;
+  suggestions?: any[];
 }
 
-export default function UploadComponent() {
-  const [isDragging, setIsDragging] = useState(false);
-  const [files, setFiles] = useState<UploadedFile[]>([]);
-  const [showClassificationDialog, setShowClassificationDialog] = useState(false);
-  const [pendingFile, setPendingFile] = useState<UploadedFile | null>(null);
+export default function Upload() {
+  const { activeProfile } = useAuth();
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [showTypeDialog, setShowTypeDialog] = useState(false);
+
+  const [jobState, setJobState] = useState<JobProgressEvent | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
 
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(true);
-  }, []);
+  // HITL Rx Confirmation Modal State
+  const [hitlOpen, setHitlOpen] = useState(false);
+  const [rxId, setRxId] = useState<number | null>(null);
+  const [rxMeds, setRxMeds] = useState<VerifiedMed[]>([]);
+  const [rxDdiAlerts, setRxDdiAlerts] = useState<any[]>([]);
+  const [rxSummary, setRxSummary] = useState("");
+  const [drugQueryIdx, setDrugQueryIdx] = useState<number | null>(null);
+  const [drugSearchResults, setDrugSearchResults] = useState<any[]>([]);
 
-  const handleDragLeave = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-  }, []);
+  // Lab Result Card State
+  const [labResult, setLabResult] = useState<any>(null);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    
-    const droppedFiles = Array.from(e.dataTransfer.files);
-    handleFiles(droppedFiles);
-  }, []);
-
-  const handleFileInput = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      const selectedFiles = Array.from(e.target.files);
-      handleFiles(selectedFiles);
-    }
-  }, []);
-
-  const handleFiles = (fileList: globalThis.File[]) => {
-    if (fileList.length === 0) return;
-
-    const file = fileList[0];
-    const newFile: UploadedFile = {
-      id: Math.random().toString(36).substr(2, 9),
-      name: file.name,
-      size: file.size,
-      type: file.type,
-      file: file,
-    };
-
-    setPendingFile(newFile);
-    setShowClassificationDialog(true);
+  const onFileSelected = (file?: File) => {
+    if (!file) return;
+    setPendingFile(file);
+    setShowTypeDialog(true);
   };
 
-  const handleClassification = async (classificationType: "prescription" | "lab_report") => {
+  const handleUpload = async (docType: "prescription" | "lab_report") => {
     if (!pendingFile) return;
-
-    setShowClassificationDialog(false);
+    setShowTypeDialog(false);
     setIsProcessing(true);
+    setLabResult(null);
+    setJobState({ job_id: "", status: "queued", progress_pct: 5, current_step: "Uploading document..." });
 
     try {
-      const formData = new FormData();
-      formData.append("file", pendingFile.file);
+      const form = new FormData();
+      form.append("file", pendingFile);
 
-      const backendUrl = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
-      const endpoint = classificationType === "prescription" 
-        ? `${backendUrl}/upload-prescription`
-        : `${backendUrl}/upload-lab-report`;
-
-      const response = await fetch(endpoint, {
+      const endpoint = docType === "prescription" ? "/upload-prescription" : "/upload-lab-report";
+      const res = await fetch(`${BACKEND_URL}${endpoint}`, {
         method: "POST",
-        body: formData,
+        headers: {
+          Authorization: `Bearer ${getStoredToken() || ""}`,
+          "X-Profile-Id": getStoredProfileId() || "",
+        },
+        body: form,
       });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || data.message || "Upload failed");
 
-      if (!response.ok) {
-        throw new Error(`Upload failed: ${response.statusText}`);
-      }
-
-      const result = await response.json();
-
-      setFiles((prev) => [...prev, { ...pendingFile, type: classificationType }]);
-      
-      toast.success(`${classificationType === "prescription" ? "Prescription" : "Lab Report"} uploaded and processed successfully`);
-      
-      console.log("Processing result:", result);
-    } catch (error) {
-      console.error("Upload error:", error);
-      toast.error("Failed to upload and process document");
-    } finally {
+      const unsub = subscribeJobProgress(
+        data.job_id,
+        (ev) => {
+          setJobState(ev);
+          if (ev.status === "completed") {
+            setIsProcessing(false);
+            const payload = ev.result_payload || {};
+            if (docType === "prescription") {
+              setRxId(payload.prescription_id);
+              setRxMeds(
+                (payload.medicines || []).map((m: any) => ({
+                  ...m,
+                  raw_name: m.brand_name || m.raw_name,
+                }))
+              );
+              setRxDdiAlerts(payload.ddi_alerts || []);
+              setRxSummary(payload.summary || "");
+              setHitlOpen(true);
+              toast.success("Prescription parsed — please confirm medicines");
+            } else {
+              setLabResult(payload);
+              toast.success("Lab report normalized & indexed!");
+            }
+          } else if (ev.status === "failed") {
+            setIsProcessing(false);
+            toast.error(ev.error_message || "Extraction failed");
+          }
+        },
+        () => {
+          setIsProcessing(false);
+        }
+      );
+      void unsub;
+    } catch (err: any) {
       setIsProcessing(false);
+      toast.error(err.message || "Upload error");
+    } finally {
       setPendingFile(null);
     }
   };
 
-  const removeFile = (id: string) => {
-    setFiles((prev) => prev.filter((f) => f.id !== id));
-    toast.info("File removed");
+  const searchCatalog = async (idx: number, q: string) => {
+    setDrugQueryIdx(idx);
+    if (q.trim().length < 2) {
+      setDrugSearchResults([]);
+      return;
+    }
+    try {
+      const data = await apiFetch(`/api/drugs/search?q=${encodeURIComponent(q)}`);
+      setDrugSearchResults(data.results || []);
+    } catch {
+      setDrugSearchResults([]);
+    }
   };
 
-  const formatFileSize = (bytes: number) => {
-    if (bytes < 1024) return bytes + " B";
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  const applySuggestion = (idx: number, sug: any) => {
+    setRxMeds((prev) =>
+      prev.map((m, i) =>
+        i === idx
+          ? {
+              ...m,
+              raw_name: sug.brand_name,
+              brand_name: sug.brand_name,
+              generic_name: sug.generic_name,
+              dosage: m.dosage || sug.strength,
+              indicative_price_bdt: sug.indicative_price_bdt,
+              confidence: sug.confidence || 1.0,
+              confidence_tier: "auto_matched",
+              needs_user_confirm: false,
+            }
+          : m
+      )
+    );
+    setDrugQueryIdx(null);
+    setDrugSearchResults([]);
+  };
+
+  const handleConfirmRx = async () => {
+    if (!rxId) return;
+    try {
+      const res = await apiFetch(`/api/prescriptions/${rxId}/confirm`, {
+        method: "POST",
+        body: JSON.stringify({
+          medicines: rxMeds.map((m) => ({
+            name: m.raw_name || m.brand_name,
+            dosage: m.dosage,
+            frequency: m.frequency_bd,
+            duration: m.duration,
+            special_instructions: m.special_instructions,
+          })),
+        }),
+      });
+      setRxDdiAlerts(res.ddi_alerts || []);
+      setHitlOpen(false);
+      toast.success(
+        res.ddi_alerts?.length
+          ? `Saved with ${res.ddi_alerts.length} Drug Interaction/Duplicate Alert(s)!`
+          : "Prescription confirmed and saved to vault!"
+      );
+    } catch (err: any) {
+      toast.error(err.message || "Confirmation failed");
+    }
   };
 
   return (
-    <div className="flex h-screen flex-col">
-      <Dialog open={showClassificationDialog} onOpenChange={setShowClassificationDialog}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Classify Document</DialogTitle>
-            <DialogDescription>
-              Please select the type of document you're uploading
-            </DialogDescription>
-          </DialogHeader>
-          <div className="flex flex-col gap-3 py-4">
-            <Button
-              className="w-full justify-start h-auto py-4"
-              variant="outline"
-              onClick={() => handleClassification("prescription")}
-            >
-              <div className="text-left">
-                <div className="font-semibold">Prescription</div>
-                <div className="text-sm text-muted-foreground">
-                  Doctor's prescription with medications and dosage
-                </div>
-              </div>
-            </Button>
-            <Button
-              className="w-full justify-start h-auto py-4"
-              variant="outline"
-              onClick={() => handleClassification("lab_report")}
-            >
-              <div className="text-left">
-                <div className="font-semibold">Lab Report</div>
-                <div className="text-sm text-muted-foreground">
-                  Blood test, lipid profile, or other lab results
-                </div>
-              </div>
-            </Button>
-          </div>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => {
-              setShowClassificationDialog(false);
-              setPendingFile(null);
-            }}>
-              Cancel
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <div className="border-b border-border bg-card px-8 py-6">
-        <h1 className="text-3xl font-bold text-foreground">Upload Reports</h1>
-        <p className="mt-2 text-muted-foreground">
-          Upload your lab reports, prescriptions, or medical documents
+    <div className="mx-auto max-w-4xl p-4 sm:p-6 space-y-5">
+      <div>
+        <h1 className="text-2xl font-bold">Upload BD Prescriptions &amp; Lab Reports</h1>
+        <p className="text-sm text-muted-foreground">
+          DGDA Brand→Generic verification, duplicate PPI/NSAID safety alerts, and <code>mmol/L</code> LOINC normalization for{" "}
+          <strong>{activeProfile?.display_name}</strong>
         </p>
       </div>
 
-      <div className="flex-1 overflow-auto p-8">
-        <div className="mx-auto max-w-4xl space-y-6">
-          <Card
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-            className={cn(
-              "relative cursor-pointer border-2 border-dashed p-12 transition-all",
-              isDragging
-                ? "border-primary bg-primary/10"
-                : "border-border hover:border-primary/50 hover:bg-muted/50",
-              isProcessing && "opacity-50 pointer-events-none"
-            )}
-          >
+      {/* Upload / Camera Dropzone */}
+      <Card className="p-8 border-2 border-dashed flex flex-col items-center text-center space-y-4">
+        <div className="rounded-full bg-primary/10 p-5">
+          <UploadIcon className="h-9 w-9 text-primary" />
+        </div>
+        <div>
+          <h3 className="font-semibold text-lg">Take Photo or Upload Prescription / Lab PDF</h3>
+          <p className="text-xs text-muted-foreground mt-1">Supports handwritten BD chamber pads &amp; Popular/Labaid/Ibn Sina PDFs</p>
+        </div>
+        <div className="flex flex-wrap gap-3 justify-center">
+          <label className="cursor-pointer">
             <input
               type="file"
-              multiple={false}
-              accept=".pdf,.jpg,.jpeg,.png"
-              onChange={handleFileInput}
-              className="absolute inset-0 cursor-pointer opacity-0"
+              accept="image/*,.pdf"
+              className="hidden"
               disabled={isProcessing}
+              onChange={(e) => onFileSelected(e.target.files?.[0])}
             />
-            <div className="flex flex-col items-center text-center">
-              <div className="rounded-full bg-primary/10 p-6">
-                <Upload className="h-10 w-10 text-primary" />
-              </div>
-              <h3 className="mt-4 text-lg font-semibold text-foreground">
-                {isProcessing ? "Processing..." : "Drop files here or click to upload"}
-              </h3>
-              <p className="mt-2 text-sm text-muted-foreground">
-                Supports PDF, JPG, PNG up to 10MB each
-              </p>
-              {!isProcessing && (
-                <Button className="mt-6" variant="default">
-                  Choose Files
-                </Button>
-              )}
-            </div>
-          </Card>
-
-          {files.length > 0 && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <h3 className="text-lg font-semibold text-foreground">
-                  Uploaded Files ({files.length})
-                </h3>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    setFiles([]);
-                    toast.info("All files cleared");
-                  }}
-                >
-                  Clear All
-                </Button>
-              </div>
-
-              <div className="space-y-3">
-                {files.map((file) => (
-                  <Card
-                    key={file.id}
-                    className="p-4 transition-all hover:shadow-md"
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className="rounded-lg bg-primary/10 p-2">
-                          <File className="h-5 w-5 text-primary" />
-                        </div>
-                        <div>
-                          <p className="font-medium text-foreground">
-                            {file.name}
-                          </p>
-                          <p className="text-sm text-muted-foreground">
-                            {formatFileSize(file.size)} • {file.type === "prescription" ? "Prescription" : "Lab Report"}
-                          </p>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <CheckCircle2 className="h-5 w-5 text-primary" />
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => removeFile(file.id)}
-                        >
-                          <X className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    </div>
-                  </Card>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {files.length === 0 && (
-            <Card className="p-6 bg-muted/50">
-              <h3 className="mb-3 text-lg font-semibold text-foreground">
-                What can you upload?
-              </h3>
-              <ul className="space-y-2 text-sm text-muted-foreground">
-                <li>• Blood test results and lab reports</li>
-                <li>• X-rays, MRIs, and scan images</li>
-                <li>• Prescriptions and medication lists</li>
-                <li>• Doctor's notes and consultation summaries</li>
-              </ul>
-            </Card>
-          )}
+            <Button type="button" asChild disabled={isProcessing}>
+              <span><FileText className="h-4 w-4 mr-2" /> Choose File / PDF</span>
+            </Button>
+          </label>
+          <label className="cursor-pointer">
+            <input
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="hidden"
+              disabled={isProcessing}
+              onChange={(e) => onFileSelected(e.target.files?.[0])}
+            />
+            <Button type="button" variant="outline" asChild disabled={isProcessing}>
+              <span><Camera className="h-4 w-4 mr-2" /> Capture Photo</span>
+            </Button>
+          </label>
         </div>
-      </div>
+      </Card>
+
+      {/* Async SSE Job Progress */}
+      {jobState && (isProcessing || jobState.status === "failed") && (
+        <Card className="p-4 space-y-2">
+          <div className="flex items-center justify-between text-sm font-medium">
+            <span className="flex items-center gap-2">
+              {isProcessing && <Loader2 className="h-4 w-4 animate-spin text-primary" />}
+              {jobState.current_step}
+            </span>
+            <span>{jobState.progress_pct}%</span>
+          </div>
+          <Progress value={jobState.progress_pct} />
+        </Card>
+      )}
+
+      {/* Lab Result Summary Card */}
+      {labResult && (
+        <Card className="p-5 space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="font-bold text-lg flex items-center gap-2">
+                <CheckCircle2 className="h-5 w-5 text-emerald-600" />
+                {labResult.lab_name || "Normalized Lab Report"}
+              </h3>
+              <p className="text-xs text-muted-foreground">Date: {labResult.report_date || "Recent"}</p>
+            </div>
+            <Badge>{labResult.normalized_metrics?.length || 0} Normalized Metrics</Badge>
+          </div>
+          {labResult.critical_alerts?.length > 0 && (
+            <div className="rounded-lg border border-red-400 bg-red-50 p-3 text-xs text-red-900 space-y-1">
+              {labResult.critical_alerts.map((a: any, i: number) => (
+                <div key={i}><strong>CRITICAL: {a.title}</strong> — {a.action}</div>
+              ))}
+            </div>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {(labResult.normalized_metrics || []).map((m: any, idx: number) => (
+              <div key={idx} className="rounded border p-2.5 flex items-center justify-between text-sm">
+                <div>
+                  <div className="font-medium">{m.canonical_name}</div>
+                  <div className="text-[11px] text-muted-foreground">Ref: {m.reference_range || "N/A"}</div>
+                </div>
+                <div className="text-right">
+                  <div className="font-bold">{m.canonical_value} {m.canonical_unit}</div>
+                  <Badge variant={m.flag === "normal" ? "outline" : "destructive"} className="text-[10px] uppercase">
+                    {m.flag}
+                  </Badge>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {/* Classification Modal */}
+      <Dialog open={showTypeDialog} onOpenChange={setShowTypeDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Classify Medical Document</DialogTitle>
+            <DialogDescription>{pendingFile?.name}</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 py-2">
+            <Button variant="outline" className="h-auto py-4 justify-start text-left" onClick={() => handleUpload("prescription")}>
+              <div>
+                <div className="font-semibold">Doctor Prescription (Handwritten / Printed)</div>
+                <div className="text-xs text-muted-foreground">Extracts medicines, 1+0+1 schedules &amp; runs DGDA DDI checks</div>
+              </div>
+            </Button>
+            <Button variant="outline" className="h-auto py-4 justify-start text-left" onClick={() => handleUpload("lab_report")}>
+              <div>
+                <div className="font-semibold">Diagnostic Lab Report (CBC, HbA1c, Creatinine, Lipids)</div>
+                <div className="text-xs text-muted-foreground">Normalizes mmol/L ↔ mg/dL, calculates CKD-EPI eGFR &amp; red flags</div>
+              </div>
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Human-in-the-Loop Prescription Verification Modal */}
+      <Dialog open={hitlOpen} onOpenChange={setHitlOpen}>
+        <DialogContent className="max-w-2xl max-h-[88vh] overflow-auto">
+          <DialogHeader>
+            <DialogTitle>Verify Extracted Bangladesh Medications</DialogTitle>
+            <DialogDescription>
+              Confirm amber/red low-confidence handwritten brands against the DGDA Bangladesh catalog before saving.
+            </DialogDescription>
+          </DialogHeader>
+
+          {rxSummary && (
+            <div className="rounded bg-muted p-2.5 text-xs text-slate-700">{rxSummary}</div>
+          )}
+
+          {rxDdiAlerts.length > 0 && (
+            <div className="rounded-lg border border-amber-500 bg-amber-50 p-3 text-xs text-amber-950 space-y-1.5">
+              <div className="font-bold flex items-center gap-1.5">
+                <AlertTriangle className="h-4 w-4 text-amber-600" />
+                Duplicate-Generic / Interaction Warning Detected
+              </div>
+              {rxDdiAlerts.map((a, i) => (
+                <div key={i}>
+                  <Badge variant="destructive" className="mr-1.5 text-[10px]">{a.rule_type}</Badge>
+                  {a.clinical_note}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="space-y-3">
+            {rxMeds.map((m, idx) => (
+              <Card key={idx} className="p-3 space-y-2 relative">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Badge
+                      variant={m.confidence >= 0.85 ? "default" : m.confidence >= 0.6 ? "secondary" : "destructive"}
+                      className="text-[10px]"
+                    >
+                      {m.confidence >= 0.85 ? "Verified" : m.confidence >= 0.6 ? "Review" : "Manual"} ({Math.round((m.confidence || 0) * 100)}%)
+                    </Badge>
+                    {m.generic_name && <span className="text-xs font-medium text-primary">{m.generic_name}</span>}
+                    {m.indicative_price_bdt && (
+                      <span className="text-[11px] text-muted-foreground">~৳{m.indicative_price_bdt}/unit</span>
+                    )}
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7"
+                    onClick={() => setRxMeds((prev) => prev.filter((_, i) => i !== idx))}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <div className="relative">
+                    <Input
+                      value={m.raw_name}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setRxMeds((prev) => prev.map((x, i) => (i === idx ? { ...x, raw_name: val } : x)));
+                        searchCatalog(idx, val);
+                      }}
+                      placeholder="BD Brand (e.g. Seclo)"
+                    />
+                    {drugQueryIdx === idx && drugSearchResults.length > 0 && (
+                      <div className="absolute z-50 left-0 right-0 mt-1 rounded border bg-popover shadow-md max-h-40 overflow-auto text-xs">
+                        {drugSearchResults.map((s, si) => (
+                          <button
+                            type="button"
+                            key={si}
+                            onClick={() => applySuggestion(idx, s)}
+                            className="w-full text-left px-2.5 py-1.5 hover:bg-muted flex justify-between"
+                          >
+                            <span><strong>{s.brand_name}</strong> ({s.strength})</span>
+                            <span className="text-muted-foreground">{s.generic_name}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <Input
+                    value={m.dosage}
+                    onChange={(e) =>
+                      setRxMeds((prev) => prev.map((x, i) => (i === idx ? { ...x, dosage: e.target.value } : x)))
+                    }
+                    placeholder="Dosage (20mg)"
+                  />
+                  <Input
+                    value={m.frequency_bd}
+                    onChange={(e) =>
+                      setRxMeds((prev) => prev.map((x, i) => (i === idx ? { ...x, frequency_bd: e.target.value } : x)))
+                    }
+                    placeholder="BD Schedule (1+0+1)"
+                  />
+                </div>
+
+                {m.needs_user_confirm && m.suggestions && m.suggestions.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5 pt-1 text-[11px]">
+                    <Search className="h-3 w-3 text-muted-foreground" />
+                    <span className="text-muted-foreground">DGDA Suggestions:</span>
+                    {m.suggestions.map((s, si) => (
+                      <Button
+                        key={si}
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-6 px-2 text-[11px]"
+                        onClick={() => applySuggestion(idx, s)}
+                      >
+                        {s.brand_name} {s.strength} ({s.generic_name})
+                      </Button>
+                    ))}
+                  </div>
+                )}
+              </Card>
+            ))}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                setRxMeds((prev) => [
+                  ...prev,
+                  {
+                    raw_name: "",
+                    brand_name: "",
+                    dosage: "",
+                    frequency_bd: "1+0+1",
+                    duration: "",
+                    special_instructions: "",
+                    confidence: 0,
+                    confidence_tier: "red_manual",
+                    needs_user_confirm: true,
+                  },
+                ])
+              }
+            >
+              <Plus className="h-3.5 w-3.5 mr-1" /> Add Medicine Row
+            </Button>
+          </div>
+
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setHitlOpen(false)}>Review Later</Button>
+            <Button onClick={handleConfirmRx}>Confirm &amp; Save to Vault</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
