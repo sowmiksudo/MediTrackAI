@@ -52,8 +52,9 @@ class CloudGeminiProvider(BaseAIProvider):
             timeout=20000,
             retry_options=types.HttpRetryOptions(attempts=1),
         )
-        self.client = genai.Client(api_key=api_key, http_options=fast_http) if api_key else None
-        self.tts_client = genai.Client(api_key=api_key, http_options=tts_http) if api_key else None
+        use_vertex = api_key.startswith("AQ.")
+        self.client = genai.Client(vertexai=use_vertex, api_key=api_key, http_options=fast_http) if api_key else None
+        self.tts_client = genai.Client(vertexai=use_vertex, api_key=api_key, http_options=tts_http) if api_key else None
 
     def _require_client(self) -> genai.Client:
         if self.client is None:
