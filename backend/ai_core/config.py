@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-jwt-secret-change-in-prod"
     file_signing_secret: str = "dev-file-signing-secret-change-in-prod"
     jwt_expire_minutes: int = 1440
-    frontend_origins: str = "http://localhost:8080,http://localhost:5173,http://127.0.0.1:8080,https://dev-server.tenstral.com"
+    frontend_origins: str = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://localhost:5173,http://127.0.0.1:8080,https://dev-server.tenstral.com"
 
     host: str = "0.0.0.0"
     port: int = 8000

@@ -7,8 +7,8 @@ import { componentTagger } from "lovable-tagger";
 export default defineConfig(({ mode }) => ({
   server: {
     host: "::",
-    port: 8080,
-    allowedHosts: ["dev-server.tenstral.com"],
+    port: 3000,
+    allowedHosts: ["dev-server.tenstral.com", ".trycloudflare.com"],
     proxy: {
       "/api-proxy": {
         target: "http://localhost:8000",

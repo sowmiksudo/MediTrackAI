@@ -4,7 +4,6 @@
 
 MediTrack reimagines healthcare as a continuous conversation, blending empathy with intelligence. Its goal is to detect health issues before they become critical, making healthcare proactive instead of reactive.
 
-
 ---
 
 ## 🧠 Overview

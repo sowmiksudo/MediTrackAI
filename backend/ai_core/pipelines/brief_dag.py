@@ -97,7 +97,7 @@ async def run_brief_dag(
     db: Session,
     patient_profile_id: Any,
     job_id: Optional[Any] = None,
-    public_base_url: str = "http://localhost:8080",
+    public_base_url: str = "http://localhost:3000",
 ) -> Dict[str, Any]:
     profile = db.query(PatientProfile).filter(PatientProfile.id == patient_profile_id).first()
     if not profile:

@@ -1,4 +1,16 @@
-export const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+function resolveBackendUrl(): string {
+  const envUrl = import.meta.env.VITE_BACKEND_URL;
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    const isLocal = host === "localhost" || host === "127.0.0.1" || host === "::1";
+    if (!isLocal && (!envUrl || envUrl.includes("localhost") || envUrl.includes("127.0.0.1"))) {
+      return "/api-proxy";
+    }
+  }
+  return envUrl || "http://localhost:8000";
+}
+
+export const BACKEND_URL = resolveBackendUrl();
 
 const TOKEN_KEY = "meditrack_jwt";
 const PROFILE_KEY = "meditrack_active_profile_id";

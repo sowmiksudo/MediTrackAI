@@ -44,7 +44,7 @@ async def generate_brief(
     profile: PatientProfile = Depends(get_active_profile),
     db: Session = Depends(get_db),
 ):
-    origin = request.headers.get("origin") or "http://localhost:8080"
+    origin = request.headers.get("origin") or "http://localhost:3000"
     job = BackgroundJob(
         patient_profile_id=profile.id,
         job_type="brief_gen",
