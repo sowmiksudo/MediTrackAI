@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from marshmallow import ValidationError as MarshmallowValidationError
 import os
 from contextlib import asynccontextmanager
-from routers import checkins, prescriptions, reports, hospitals, insurances, appointments
+from routers import checkins, prescriptions, reports, hospitals, insurances, appointments, live_ws
 from db.database import init_db, SessionLocal
 from db.models import CheckIn, Prescription, Report, OverallReport
 from sqlalchemy import desc
@@ -135,6 +135,7 @@ app.include_router(reports.router)
 app.include_router(hospitals.router)
 app.include_router(insurances.router)
 app.include_router(appointments.router)
+app.include_router(live_ws.router)
 
 # Root endpoint
 @app.get("/")

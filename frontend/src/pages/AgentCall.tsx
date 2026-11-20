@@ -8,7 +8,7 @@ import { cn } from "@/lib/utils";
 import { motion, AnimatePresence } from "framer-motion";
 
 // Import utility classes
-import { GeminiLiveAPI } from "@/utils/gemini-live-api";
+import { GeminiLiveAPI, getLiveWebSocketUrl } from "@/utils/gemini-live-api";
 import { AudioRecorder } from "@/utils/audio-recorder";
 import { AudioStreamer } from "@/utils/audio-streamer";
 import { SequentialCallRecorder } from "@/utils/sequential-call-recorder";
@@ -52,12 +52,9 @@ export default function AgentCall() {
     confirmationNumber?: string;
   }>({ confirmed: false });
 
-  // Loaded from .env (VITE_GEMINI_API_KEY)
-  const API_KEY = import.meta.env.VITE_GEMINI_API_KEY || '';
-  const endpoint = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
-
   // Loaded from .env (VITE_BACKEND_URL)
   const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
+  const endpoint = getLiveWebSocketUrl(BACKEND_URL);
 
   // Timer effect
   useEffect(() => {

@@ -1,3 +1,11 @@
+export function getLiveWebSocketUrl(backendUrl = 'http://localhost:8000') {
+  if (backendUrl.startsWith('/')) {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${proto}//${window.location.host}${backendUrl}/ws/live`;
+  }
+  return `${backendUrl.replace(/^http/, 'ws').replace(/\/$/, '')}/ws/live`;
+}
+
 export class GeminiLiveAPI {
   constructor(endpoint, autoSetup = true, setupConfig = null) {
     this.ws = new WebSocket(endpoint);
